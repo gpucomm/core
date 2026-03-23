@@ -10,6 +10,7 @@ private func usage(_ exitCode: Int32) -> Never {
       gpucomm bench bandwidth-sweep [--sizes-mib CSV] [--iters N] [--mode shared|private] [--reps N] [--format human|jsonl|csv]
       gpucomm bench scan [--n N] [--iters N] [--warmup N] [--reps N] [--format human|json|csv]
       gpucomm bench scan-sweep [--ns CSV] [--iters N] [--warmup N] [--reps N] [--format human|jsonl|csv]
+      gpucomm bench latency [--kind empty|kernel] [--iters N] [--warmup N] [--reps N] [--format human|json|csv]
       gpucomm bench matmul [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--reps N] [--variant naive|tiled8|tiled16|tiled32] [--tg-x N] [--tg-y N] [--format human|json|csv]
       gpucomm bench matmul-sweep [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--reps N] [--format human|jsonl|csv]
       gpucomm bench transfer [--size-kib N] [--iters N] [--warmup N] [--reps N] [--direction h2d|d2h] [--mode shared|private] [--strategy memcpy|blit] [--format human|json|csv]
@@ -22,6 +23,7 @@ private func usage(_ exitCode: Int32) -> Never {
       gpucomm bench bandwidth-sweep --sizes-mib 1,4,16,64 --iters 200 --mode private --format jsonl
       gpucomm bench scan --n 1024 --iters 200 --warmup 20
       gpucomm bench scan-sweep --ns 1024,4096,65536,1048576 --iters 50 --warmup 10 --format jsonl
+      gpucomm bench latency --kind kernel --iters 2000 --warmup 200 --reps 5 --format json
       gpucomm bench matmul --m 256 --n 256 --k 256 --iters 50 --warmup 10 --variant tiled16
       gpucomm bench matmul --m 512 --n 512 --k 512 --iters 20 --warmup 5 --variant naive --tg-x 16 --tg-y 8
       gpucomm bench matmul-sweep --m 512 --n 512 --k 512 --iters 10 --warmup 3
@@ -788,6 +790,81 @@ do {
                             p.ok ? "true" : "false",
                         ]
                     }
+                )
+            }
+
+        case "latency":
+            let kindRaw = reader.popValue(for: "--kind") ?? "kernel"
+            guard let kind = LatencyKind(rawValue: kindRaw) else {
+                die("invalid --kind '\(kindRaw)' (expected empty|kernel)")
+            }
+            let iters = reader.popInt(for: "--iters") ?? 2000
+            let warmup = reader.popInt(for: "--warmup") ?? 200
+            let reps = reader.popInt(for: "--reps") ?? 1
+            let format = OutputOptions.parse(&reader, defaultFormat: .human, jsonImplies: .json)
+            if !reader.isEmpty { usage(1) }
+
+            let clampedReps = max(1, reps)
+            var wallAvgSamples: [Double] = []
+            var gpuAvgSamples: [Double] = []
+            wallAvgSamples.reserveCapacity(clampedReps)
+            gpuAvgSamples.reserveCapacity(clampedReps)
+
+            for _ in 0..<clampedReps {
+                let m = try LatencyBenchmark.runOnce(context: context, kernels: kernels, kind: kind, iters: iters, warmup: warmup)
+                wallAvgSamples.append(m.wallAvgMicros)
+                if let g = m.gpuAvgMicros { gpuAvgSamples.append(g) }
+            }
+
+            let wall = Stats.summarize(wallAvgSamples)
+            let gpu = gpuAvgSamples.isEmpty ? nil : Stats.summarize(gpuAvgSamples)
+
+            switch format {
+            case .human:
+                var tail = ""
+                if let gpu {
+                    tail = String(format: " gpu_avg_us_p50=%.3f gpu_avg_us_p95=%.3f", gpu.p50, gpu.p95)
+                }
+                print(String(
+                    format: "latency kind=%@ iters=%d warmup=%d reps=%d wall_avg_us_p50=%.3f wall_avg_us_p95=%.3f%@",
+                    kind.rawValue,
+                    iters,
+                    warmup,
+                    wall.count,
+                    wall.p50,
+                    wall.p95,
+                    tail
+                ))
+            case .json, .jsonl:
+                var obj: [String: Any] = [
+                    "bench": "latency",
+                    "kind": kind.rawValue,
+                    "iters": iters,
+                    "warmup": warmup,
+                    "reps": wall.count,
+                    "wall_avg_us_p50": wall.p50,
+                    "wall_avg_us_p95": wall.p95,
+                ]
+                if let gpu {
+                    obj["gpu_avg_us_p50"] = gpu.p50
+                    obj["gpu_avg_us_p95"] = gpu.p95
+                }
+                let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+                print(String(decoding: data, as: UTF8.self))
+            case .csv:
+                printCSV(
+                    header: ["bench", "kind", "iters", "warmup", "reps", "wall_avg_us_p50", "wall_avg_us_p95", "gpu_avg_us_p50", "gpu_avg_us_p95"],
+                    rows: [[
+                        "latency",
+                        kind.rawValue,
+                        "\(iters)",
+                        "\(warmup)",
+                        "\(wall.count)",
+                        "\(wall.p50)",
+                        "\(wall.p95)",
+                        gpu.map { "\($0.p50)" } ?? "",
+                        gpu.map { "\($0.p95)" } ?? "",
+                    ]]
                 )
             }
 

@@ -295,3 +295,12 @@ kernel void matmul_f32_tiled_32(
         C[row * N + col] = acc;
     }
 }
+
+kernel void latency_noop_u32(
+    device const uint* inBuffer [[buffer(0)]],
+    device uint* outBuffer [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    // Minimal kernel to measure launch+submit latency without being optimized away.
+    outBuffer[gid] = inBuffer[gid] + 1u;
+}
