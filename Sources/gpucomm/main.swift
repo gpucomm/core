@@ -7,13 +7,13 @@ private func usage(_ exitCode: Int32) -> Never {
 
     Usage:
       gpucomm bench bandwidth [--size-mib N] [--iters N] [--mode shared|private] [--format human|json|csv]
-      gpucomm bench bandwidth-sweep [--sizes-mib CSV] [--iters N] [--mode shared|private] [--format human|jsonl|csv]
+      gpucomm bench bandwidth-sweep [--sizes-mib CSV] [--iters N] [--mode shared|private] [--reps N] [--format human|jsonl|csv]
       gpucomm bench scan [--n N] [--iters N] [--warmup N] [--format human|json|csv]
-      gpucomm bench scan-sweep [--ns CSV] [--iters N] [--warmup N] [--format human|jsonl|csv]
+      gpucomm bench scan-sweep [--ns CSV] [--iters N] [--warmup N] [--reps N] [--format human|jsonl|csv]
       gpucomm bench matmul [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--variant naive|tiled8|tiled16|tiled32] [--tg-x N] [--tg-y N] [--format human|json|csv]
-      gpucomm bench matmul-sweep [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--format human|jsonl|csv]
+      gpucomm bench matmul-sweep [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--reps N] [--format human|jsonl|csv]
       gpucomm bench transfer [--size-kib N] [--iters N] [--warmup N] [--direction h2d|d2h] [--mode shared|private] [--strategy memcpy|blit] [--format human|json|csv]
-      gpucomm bench transfer-sweep [--sizes-kib CSV] [--iters N] [--warmup N] [--direction h2d|d2h|both] [--mode shared|private|both] [--format human|jsonl|csv]
+      gpucomm bench transfer-sweep [--sizes-kib CSV] [--iters N] [--warmup N] [--reps N] [--direction h2d|d2h|both] [--mode shared|private|both] [--format human|jsonl|csv]
       gpucomm run reduction [--n N]
 
     Examples:
@@ -96,6 +96,7 @@ do {
             let sizesCSV = reader.popValue(for: "--sizes-mib") ?? "1,4,16,64"
             let iters = reader.popInt(for: "--iters") ?? 200
             let modeRaw = reader.popValue(for: "--mode") ?? "private"
+            let reps = reader.popInt(for: "--reps") ?? 1
             guard let mode = StorageMode(rawValue: modeRaw) else {
                 die("invalid --mode '\(modeRaw)' (expected shared|private)")
             }
@@ -109,32 +110,88 @@ do {
                 .filter { $0 > 0 }
             if sizesMiB.isEmpty { die("invalid --sizes-mib '\(sizesCSV)' (expected comma-separated ints)") }
 
-            let results = try sizesMiB.map { sizeMiB in
-                try BandwidthBenchmark.run(
-                    context: context,
-                    kernels: kernels,
+            let clampedReps = max(1, reps)
+            struct BWPoint {
+                let sizeBytes: Int
+                let iters: Int
+                let mode: StorageMode
+                let gibps: StatsSummary
+                let gpuMs: StatsSummary
+            }
+
+            let points: [BWPoint] = try sizesMiB.map { sizeMiB in
+                var gibpsSamples: [Double] = []
+                var gpuMsSamples: [Double] = []
+                gibpsSamples.reserveCapacity(clampedReps)
+                gpuMsSamples.reserveCapacity(clampedReps)
+
+                for _ in 0..<clampedReps {
+                    let r = try BandwidthBenchmark.run(
+                        context: context,
+                        kernels: kernels,
+                        sizeBytes: sizeMiB * 1024 * 1024,
+                        iters: iters,
+                        mode: mode
+                    )
+                    gibpsSamples.append(r.gibPerSecond)
+                    gpuMsSamples.append(r.gpuSeconds * 1000.0)
+                }
+
+                return BWPoint(
                     sizeBytes: sizeMiB * 1024 * 1024,
                     iters: iters,
-                    mode: mode
+                    mode: mode,
+                    gibps: Stats.summarize(gibpsSamples),
+                    gpuMs: Stats.summarize(gpuMsSamples)
                 )
             }
 
             switch format {
             case .human:
-                for r in results { print(r.prettyLine) }
+                for p in points {
+                    let mib = Double(p.sizeBytes) / (1024.0 * 1024.0)
+                    print(String(
+                        format: "bandwidth mode=%@ size=%.1fMiB iters=%d reps=%d gibps_p50=%.2f gibps_p95=%.2f gpu_ms_p50=%.3f gpu_ms_p95=%.3f",
+                        p.mode.rawValue,
+                        mib,
+                        p.iters,
+                        p.gibps.count,
+                        p.gibps.p50,
+                        p.gibps.p95,
+                        p.gpuMs.p50,
+                        p.gpuMs.p95
+                    ))
+                }
             case .json, .jsonl:
-                for r in results { print(try r.jsonLine()) }
+                for p in points {
+                    let obj: [String: Any] = [
+                        "bench": "bandwidth",
+                        "mode": p.mode.rawValue,
+                        "size_bytes": p.sizeBytes,
+                        "iters": p.iters,
+                        "reps": p.gibps.count,
+                        "gib_per_second_p50": p.gibps.p50,
+                        "gib_per_second_p95": p.gibps.p95,
+                        "gpu_ms_p50": p.gpuMs.p50,
+                        "gpu_ms_p95": p.gpuMs.p95,
+                    ]
+                    let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+                    print(String(decoding: data, as: UTF8.self))
+                }
             case .csv:
                 printCSV(
-                    header: ["bench", "mode", "size_bytes", "iters", "gpu_seconds", "gib_per_second"],
-                    rows: results.map { r in
+                    header: ["bench", "mode", "size_bytes", "iters", "reps", "gibps_p50", "gibps_p95", "gpu_ms_p50", "gpu_ms_p95"],
+                    rows: points.map { p in
                         [
                             "bandwidth",
-                            r.mode.rawValue,
-                            "\(r.sizeBytes)",
-                            "\(r.iters)",
-                            "\(r.gpuSeconds)",
-                            "\(r.gibPerSecond)",
+                            p.mode.rawValue,
+                            "\(p.sizeBytes)",
+                            "\(p.iters)",
+                            "\(p.gibps.count)",
+                            "\(p.gibps.p50)",
+                            "\(p.gibps.p95)",
+                            "\(p.gpuMs.p50)",
+                            "\(p.gpuMs.p95)",
                         ]
                     }
                 )
@@ -197,6 +254,7 @@ do {
             let sizesCSV = reader.popValue(for: "--sizes-kib") ?? "1,4,64"
             let iters = reader.popInt(for: "--iters") ?? 5000
             let warmup = reader.popInt(for: "--warmup") ?? 200
+            let reps = reader.popInt(for: "--reps") ?? 1
             let directionRaw = reader.popValue(for: "--direction") ?? "both"
             let modeRaw = reader.popValue(for: "--mode") ?? "both"
             let format = OutputOptions.parse(&reader, defaultFormat: .human, jsonImplies: .jsonl)
@@ -233,21 +291,62 @@ do {
                 die("invalid --mode '\(modeRaw)' (expected shared|private|both)")
             }
 
-            var results: [TransferResult] = []
-            results.reserveCapacity(sizesKiB.count * directions.count * modes.count)
+            let clampedReps = max(1, reps)
+            struct XferPoint {
+                let direction: TransferDirection
+                let mode: StorageMode
+                let strategy: TransferStrategy
+                let sizeBytes: Int
+                let iters: Int
+                let warmup: Int
+                let avgUs: StatsSummary
+                let bytesPerSec: StatsSummary
+                let gpuMs: StatsSummary?
+            }
+
+            var points: [XferPoint] = []
+            points.reserveCapacity(sizesKiB.count * directions.count * modes.count)
 
             for sizeKiB in sizesKiB {
                 for direction in directions {
                     for mode in modes {
                         let strategy: TransferStrategy = (mode == .shared) ? .memcpy : .blit
-                        results.append(try TransferBenchmark.run(
-                            context: context,
+
+                        var avgSamples: [Double] = []
+                        var bpsSamples: [Double] = []
+                        var gpuMsSamples: [Double] = []
+                        avgSamples.reserveCapacity(clampedReps)
+                        bpsSamples.reserveCapacity(clampedReps)
+                        gpuMsSamples.reserveCapacity(clampedReps)
+
+                        for _ in 0..<clampedReps {
+                            let r = try TransferBenchmark.run(
+                                context: context,
+                                sizeBytes: sizeKiB * 1024,
+                                iters: iters,
+                                warmup: warmup,
+                                direction: direction,
+                                mode: mode,
+                                strategy: strategy
+                            )
+                            avgSamples.append(r.avgMicros)
+                            bpsSamples.append(r.bytesPerSecond)
+                            if let g = r.gpuSeconds {
+                                gpuMsSamples.append(g * 1000.0)
+                            }
+                        }
+
+                        let gpuSummary = gpuMsSamples.isEmpty ? nil : Stats.summarize(gpuMsSamples)
+                        points.append(XferPoint(
+                            direction: direction,
+                            mode: mode,
+                            strategy: strategy,
                             sizeBytes: sizeKiB * 1024,
                             iters: iters,
                             warmup: warmup,
-                            direction: direction,
-                            mode: mode,
-                            strategy: strategy
+                            avgUs: Stats.summarize(avgSamples),
+                            bytesPerSec: Stats.summarize(bpsSamples),
+                            gpuMs: gpuSummary
                         ))
                     }
                 }
@@ -255,25 +354,66 @@ do {
 
             switch format {
             case .human:
-                for r in results { print(r.prettyLine) }
+                for p in points {
+                    let kib = Double(p.sizeBytes) / 1024.0
+                    print(String(
+                        format: "transfer dir=%@ mode=%@ strategy=%@ size=%.1fKiB iters=%d warmup=%d reps=%d avg_us_p50=%.3f avg_us_p95=%.3f bps_p50=%.0f bps_p95=%.0f%@",
+                        p.direction.rawValue,
+                        p.mode.rawValue,
+                        p.strategy.rawValue,
+                        kib,
+                        p.iters,
+                        p.warmup,
+                        p.avgUs.count,
+                        p.avgUs.p50,
+                        p.avgUs.p95,
+                        p.bytesPerSec.p50,
+                        p.bytesPerSec.p95,
+                        p.gpuMs.map { String(format: " gpu_ms_p50=%.3f gpu_ms_p95=%.3f", $0.p50, $0.p95) } ?? ""
+                    ))
+                }
             case .json, .jsonl:
-                for r in results { print(try r.jsonLine()) }
+                for p in points {
+                    var obj: [String: Any] = [
+                        "bench": "transfer",
+                        "direction": p.direction.rawValue,
+                        "mode": p.mode.rawValue,
+                        "strategy": p.strategy.rawValue,
+                        "size_bytes": p.sizeBytes,
+                        "iters": p.iters,
+                        "warmup": p.warmup,
+                        "reps": p.avgUs.count,
+                        "avg_us_p50": p.avgUs.p50,
+                        "avg_us_p95": p.avgUs.p95,
+                        "bytes_per_second_p50": p.bytesPerSec.p50,
+                        "bytes_per_second_p95": p.bytesPerSec.p95,
+                    ]
+                    if let g = p.gpuMs {
+                        obj["gpu_ms_p50"] = g.p50
+                        obj["gpu_ms_p95"] = g.p95
+                    }
+                    let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+                    print(String(decoding: data, as: UTF8.self))
+                }
             case .csv:
                 printCSV(
-                    header: ["bench", "direction", "mode", "strategy", "size_bytes", "iters", "warmup", "wall_seconds", "gpu_seconds", "bytes_per_second", "avg_us"],
-                    rows: results.map { r in
+                    header: ["bench", "direction", "mode", "strategy", "size_bytes", "iters", "warmup", "reps", "avg_us_p50", "avg_us_p95", "bytes_per_second_p50", "bytes_per_second_p95", "gpu_ms_p50", "gpu_ms_p95"],
+                    rows: points.map { p in
                         [
                             "transfer",
-                            r.direction.rawValue,
-                            r.mode.rawValue,
-                            r.strategy.rawValue,
-                            "\(r.sizeBytes)",
-                            "\(r.iters)",
-                            "\(r.warmup)",
-                            "\(r.wallSeconds)",
-                            r.gpuSeconds.map { "\($0)" } ?? "",
-                            "\(r.bytesPerSecond)",
-                            "\(r.avgMicros)",
+                            p.direction.rawValue,
+                            p.mode.rawValue,
+                            p.strategy.rawValue,
+                            "\(p.sizeBytes)",
+                            "\(p.iters)",
+                            "\(p.warmup)",
+                            "\(p.avgUs.count)",
+                            "\(p.avgUs.p50)",
+                            "\(p.avgUs.p95)",
+                            "\(p.bytesPerSec.p50)",
+                            "\(p.bytesPerSec.p95)",
+                            p.gpuMs.map { "\($0.p50)" } ?? "",
+                            p.gpuMs.map { "\($0.p95)" } ?? "",
                         ]
                     }
                 )
@@ -312,6 +452,7 @@ do {
             let nsCSV = reader.popValue(for: "--ns") ?? "1024,4096,65536,1048576"
             let iters = reader.popInt(for: "--iters") ?? 50
             let warmup = reader.popInt(for: "--warmup") ?? 10
+            let reps = reader.popInt(for: "--reps") ?? 1
             let format = OutputOptions.parse(&reader, defaultFormat: .human, jsonImplies: .jsonl)
             if !reader.isEmpty { usage(1) }
 
@@ -322,28 +463,86 @@ do {
 
             if ns.isEmpty { die("invalid --ns '\(nsCSV)' (expected comma-separated ints)") }
 
-            let results = try ns.map { n in
-                try ScanBenchmark.run(context: context, kernels: kernels, n: n, iters: iters, warmup: warmup)
+            let clampedReps = max(1, reps)
+            struct ScanPoint {
+                let n: Int
+                let iters: Int
+                let warmup: Int
+                let ok: Bool
+                let avgUs: StatsSummary
+                let gpuMs: StatsSummary
+            }
+
+            let points: [ScanPoint] = try ns.map { n in
+                var avgSamples: [Double] = []
+                var gpuMsSamples: [Double] = []
+                avgSamples.reserveCapacity(clampedReps)
+                gpuMsSamples.reserveCapacity(clampedReps)
+                var okAll = true
+                for _ in 0..<clampedReps {
+                    let r = try ScanBenchmark.run(context: context, kernels: kernels, n: n, iters: iters, warmup: warmup)
+                    avgSamples.append(r.avgMicros)
+                    gpuMsSamples.append(r.gpuSeconds * 1000.0)
+                    okAll = okAll && r.ok
+                }
+                return ScanPoint(
+                    n: n,
+                    iters: iters,
+                    warmup: warmup,
+                    ok: okAll,
+                    avgUs: Stats.summarize(avgSamples),
+                    gpuMs: Stats.summarize(gpuMsSamples)
+                )
             }
 
             switch format {
             case .human:
-                for r in results { print(r.prettyLine) }
+                for p in points {
+                    print(String(
+                        format: "scan n=%d iters=%d warmup=%d reps=%d avg_us_p50=%.3f avg_us_p95=%.3f gpu_ms_p50=%.3f gpu_ms_p95=%.3f ok=%@",
+                        p.n,
+                        p.iters,
+                        p.warmup,
+                        p.avgUs.count,
+                        p.avgUs.p50,
+                        p.avgUs.p95,
+                        p.gpuMs.p50,
+                        p.gpuMs.p95,
+                        p.ok ? "true" : "false"
+                    ))
+                }
             case .json, .jsonl:
-                for r in results { print(try r.jsonLine()) }
+                for p in points {
+                    let obj: [String: Any] = [
+                        "bench": "scan",
+                        "n": p.n,
+                        "iters": p.iters,
+                        "warmup": p.warmup,
+                        "reps": p.avgUs.count,
+                        "avg_us_p50": p.avgUs.p50,
+                        "avg_us_p95": p.avgUs.p95,
+                        "gpu_ms_p50": p.gpuMs.p50,
+                        "gpu_ms_p95": p.gpuMs.p95,
+                        "ok": p.ok,
+                    ]
+                    let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+                    print(String(decoding: data, as: UTF8.self))
+                }
             case .csv:
                 printCSV(
-                    header: ["bench", "n", "iters", "warmup", "gpu_seconds", "wall_seconds", "avg_us", "ok"],
-                    rows: results.map { r in
+                    header: ["bench", "n", "iters", "warmup", "reps", "avg_us_p50", "avg_us_p95", "gpu_ms_p50", "gpu_ms_p95", "ok"],
+                    rows: points.map { p in
                         [
                             "scan",
-                            "\(r.n)",
-                            "\(r.iters)",
-                            "\(r.warmup)",
-                            "\(r.gpuSeconds)",
-                            "\(r.wallSeconds)",
-                            "\(r.avgMicros)",
-                            r.ok ? "true" : "false",
+                            "\(p.n)",
+                            "\(p.iters)",
+                            "\(p.warmup)",
+                            "\(p.avgUs.count)",
+                            "\(p.avgUs.p50)",
+                            "\(p.avgUs.p95)",
+                            "\(p.gpuMs.p50)",
+                            "\(p.gpuMs.p95)",
+                            p.ok ? "true" : "false",
                         ]
                     }
                 )
@@ -409,6 +608,7 @@ do {
             let k = reader.popInt(for: "--k") ?? 512
             let iters = reader.popInt(for: "--iters") ?? 10
             let warmup = reader.popInt(for: "--warmup") ?? 3
+            let reps = reader.popInt(for: "--reps") ?? 1
             let format = OutputOptions.parse(&reader, defaultFormat: .human, jsonImplies: .jsonl)
             if !reader.isEmpty { usage(1) }
 
@@ -419,61 +619,144 @@ do {
                 (32, 8),
             ]
 
-            var results: [MatmulResult] = []
-            results.reserveCapacity(candidates.count + 3)
+            let clampedReps = max(1, reps)
 
-            for (x, y) in candidates {
-                results.append(try MatmulBenchmark.run(
-                    context: context,
-                    kernels: kernels,
+            struct MatmulPoint {
+                let variant: MatmulVariant
+                let tgX: Int?
+                let tgY: Int?
+                let m: Int
+                let n: Int
+                let k: Int
+                let iters: Int
+                let warmup: Int
+                let ok: Bool
+                let avgUs: StatsSummary
+                let gflops: StatsSummary
+                let gpuMs: StatsSummary
+            }
+
+            func runPoint(variant: MatmulVariant, tgX: Int? = nil, tgY: Int? = nil) throws -> MatmulPoint {
+                var avgSamples: [Double] = []
+                var gflopsSamples: [Double] = []
+                var gpuMsSamples: [Double] = []
+                avgSamples.reserveCapacity(clampedReps)
+                gflopsSamples.reserveCapacity(clampedReps)
+                gpuMsSamples.reserveCapacity(clampedReps)
+                var okAll = true
+                for _ in 0..<clampedReps {
+                    let r = try MatmulBenchmark.run(
+                        context: context,
+                        kernels: kernels,
+                        m: m,
+                        n: n,
+                        k: k,
+                        iters: iters,
+                        warmup: warmup,
+                        variant: variant,
+                        tgX: tgX,
+                        tgY: tgY
+                    )
+                    avgSamples.append(r.avgMicros)
+                    gflopsSamples.append(r.gflops)
+                    gpuMsSamples.append(r.gpuSeconds * 1000.0)
+                    okAll = okAll && r.ok
+                }
+                return MatmulPoint(
+                    variant: variant,
+                    tgX: tgX,
+                    tgY: tgY,
                     m: m,
                     n: n,
                     k: k,
                     iters: iters,
                     warmup: warmup,
-                    variant: .naive,
-                    tgX: x,
-                    tgY: y
-                ))
+                    ok: okAll,
+                    avgUs: Stats.summarize(avgSamples),
+                    gflops: Stats.summarize(gflopsSamples),
+                    gpuMs: Stats.summarize(gpuMsSamples)
+                )
+            }
+
+            var points: [MatmulPoint] = []
+            points.reserveCapacity(candidates.count + 3)
+
+            for (x, y) in candidates {
+                points.append(try runPoint(variant: .naive, tgX: x, tgY: y))
             }
 
             for variant in [MatmulVariant.tiled8, .tiled16, .tiled32] {
-                results.append(try MatmulBenchmark.run(
-                    context: context,
-                    kernels: kernels,
-                    m: m,
-                    n: n,
-                    k: k,
-                    iters: iters,
-                    warmup: warmup,
-                    variant: variant
-                ))
+                points.append(try runPoint(variant: variant))
             }
 
             switch format {
             case .human:
-                for r in results { print(r.prettyLine) }
+                for p in points {
+                    var head = "matmul var=\(p.variant.rawValue)"
+                    if let tgX = p.tgX, let tgY = p.tgY { head += " tg=\(tgX)x\(tgY)" }
+                    print(String(
+                        format: "%@ m=%d n=%d k=%d iters=%d reps=%d gflops_p50=%.2f gflops_p95=%.2f avg_us_p50=%.3f avg_us_p95=%.3f gpu_ms_p50=%.3f gpu_ms_p95=%.3f ok=%@",
+                        head,
+                        p.m, p.n, p.k,
+                        p.iters,
+                        p.gflops.count,
+                        p.gflops.p50,
+                        p.gflops.p95,
+                        p.avgUs.p50,
+                        p.avgUs.p95,
+                        p.gpuMs.p50,
+                        p.gpuMs.p95,
+                        p.ok ? "true" : "false"
+                    ))
+                }
             case .jsonl, .json:
-                for r in results { print(try r.jsonLine()) }
+                for p in points {
+                    var obj: [String: Any] = [
+                        "bench": "matmul",
+                        "variant": p.variant.rawValue,
+                        "m": p.m,
+                        "n": p.n,
+                        "k": p.k,
+                        "iters": p.iters,
+                        "warmup": p.warmup,
+                        "reps": p.gflops.count,
+                        "gflops_p50": p.gflops.p50,
+                        "gflops_p95": p.gflops.p95,
+                        "avg_us_p50": p.avgUs.p50,
+                        "avg_us_p95": p.avgUs.p95,
+                        "gpu_ms_p50": p.gpuMs.p50,
+                        "gpu_ms_p95": p.gpuMs.p95,
+                        "ok": p.ok,
+                    ]
+                    if let tgX = p.tgX, let tgY = p.tgY {
+                        obj["tg_x"] = tgX
+                        obj["tg_y"] = tgY
+                    }
+                    let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+                    print(String(decoding: data, as: UTF8.self))
+                }
             case .csv:
                 printCSV(
-                    header: ["bench", "variant", "tg_x", "tg_y", "m", "n", "k", "iters", "warmup", "gpu_seconds", "wall_seconds", "avg_us", "gflops", "ok"],
-                    rows: results.map { r in
+                    header: ["bench", "variant", "tg_x", "tg_y", "m", "n", "k", "iters", "warmup", "reps", "gflops_p50", "gflops_p95", "avg_us_p50", "avg_us_p95", "gpu_ms_p50", "gpu_ms_p95", "ok"],
+                    rows: points.map { p in
                         [
                             "matmul",
-                            r.variant.rawValue,
-                            r.tgX.map { "\($0)" } ?? "",
-                            r.tgY.map { "\($0)" } ?? "",
-                            "\(r.m)",
-                            "\(r.n)",
-                            "\(r.k)",
-                            "\(r.iters)",
-                            "\(r.warmup)",
-                            "\(r.gpuSeconds)",
-                            "\(r.wallSeconds)",
-                            "\(r.avgMicros)",
-                            "\(r.gflops)",
-                            r.ok ? "true" : "false",
+                            p.variant.rawValue,
+                            p.tgX.map { "\($0)" } ?? "",
+                            p.tgY.map { "\($0)" } ?? "",
+                            "\(p.m)",
+                            "\(p.n)",
+                            "\(p.k)",
+                            "\(p.iters)",
+                            "\(p.warmup)",
+                            "\(p.gflops.count)",
+                            "\(p.gflops.p50)",
+                            "\(p.gflops.p95)",
+                            "\(p.avgUs.p50)",
+                            "\(p.avgUs.p95)",
+                            "\(p.gpuMs.p50)",
+                            "\(p.gpuMs.p95)",
+                            p.ok ? "true" : "false",
                         ]
                     }
                 )
