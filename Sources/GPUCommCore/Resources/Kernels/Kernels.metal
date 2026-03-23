@@ -159,3 +159,63 @@ kernel void scan_add_block_offsets_u32(
     uint blockId = gid / 1024u;
     outBuffer[gid] += blockOffsets[blockId];
 }
+
+kernel void matmul_f32_naive(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint row = gid.y;
+    uint col = gid.x;
+    if (row >= M || col >= N) { return; }
+
+    float acc = 0.0f;
+    for (uint k = 0; k < K; k++) {
+        acc += A[row * K + k] * B[k * N + col];
+    }
+    C[row * N + col] = acc;
+}
+
+// Tiled matmul: 16x16 output tile per threadgroup.
+// Threads: 16x16, each computes one C element.
+kernel void matmul_f32_tiled_16(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]]
+) {
+    const uint TILE = 16u;
+    uint row = tgPos.y * TILE + tid.y;
+    uint col = tgPos.x * TILE + tid.x;
+
+    threadgroup float Asub[16][16];
+    threadgroup float Bsub[16][16];
+
+    float acc = 0.0f;
+    uint kTiles = (K + TILE - 1u) / TILE;
+    for (uint t = 0; t < kTiles; t++) {
+        uint aCol = t * TILE + tid.x;
+        uint bRow = t * TILE + tid.y;
+
+        Asub[tid.y][tid.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;
+        Bsub[tid.y][tid.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < TILE; kk++) {
+            acc += Asub[tid.y][kk] * Bsub[kk][tid.x];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}
