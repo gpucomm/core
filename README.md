@@ -1,5 +1,7 @@
 # gpucomm/core
 
+![Minimalist white cat illustration](assets/minimalist-white-cat.png)
+
 Low-level GPU compute runtime for Apple Silicon, focused on memory, synchronization, and data movement using Metal.
 
 ## Goals
