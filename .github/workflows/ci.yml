@@ -14,4 +14,5 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode.app
       - name: Build (release)
         run: swift build -c release
-
+      - name: CLI help (no GPU)
+        run: ./.build/release/gpucomm --help

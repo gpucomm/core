@@ -42,6 +42,21 @@ private func die(_ message: String, exitCode: Int32 = 1) -> Never {
 let argv = Array(CommandLine.arguments.dropFirst())
 if argv.isEmpty { usage(0) }
 
+// Allow help without requiring a Metal device (useful for CI).
+if let first = argv.first, ["-h", "--help", "help"].contains(first) {
+    usage(0)
+}
+if argv.first == "bench" {
+    if argv.count == 1 || ["-h", "--help", "help"].contains(argv[1]) {
+        usage(0)
+    }
+}
+if argv.first == "run" {
+    if argv.count == 1 || ["-h", "--help", "help"].contains(argv[1]) {
+        usage(0)
+    }
+}
+
 guard let context = MetalContext() else {
     die("Metal device not available (are you on macOS with a supported GPU?)")
 }
