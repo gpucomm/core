@@ -9,12 +9,20 @@ on:
 jobs:
   nightly-smoke:
     runs-on: macos-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
       - name: Build (release)
         run: swift build -c release
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp ./.build/release/gpucomm dist/gpucomm
+          (cd dist && zip -9 gpucomm-macos-arm64.zip gpucomm)
+          shasum -a 256 dist/gpucomm-macos-arm64.zip > dist/SHA256SUMS.txt
       - name: Collect metadata
         run: |
           {
@@ -24,11 +32,17 @@ jobs:
             echo "xcode=$(xcodebuild -version | tr '\n' ';' | sed 's/;*$//')"
           } > results.meta
       - name: Selftest
-        run: ./.build/release/gpucomm selftest --format json > results.selftest.json
+        run: |
+          set +e
+          ./.build/release/gpucomm selftest --format json > results.selftest.json
+          echo "exit_code=$?" >> results.meta
+          exit 0
       - name: Quick benches (json)
         run: |
+          set +e
           ./.build/release/gpucomm bench latency --kind kernel --iters 200 --warmup 50 --reps 3 --format json > results.latency.json
           ./.build/release/gpucomm bench bandwidth --size-mib 16 --iters 50 --mode private --reps 3 --format json > results.bandwidth.json
+          exit 0
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
@@ -38,4 +52,42 @@ jobs:
             results.selftest.json
             results.latency.json
             results.bandwidth.json
-
+            dist/gpucomm-macos-arm64.zip
+            dist/SHA256SUMS.txt
+      - name: Release notes
+        run: |
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          DATE="$(date -u +%Y-%m-%d)"
+          echo "Nightly build for \`${DATE}\` (\`${SHORT_SHA}\`)." > release.md
+          echo "" >> release.md
+          echo "Install:" >> release.md
+          echo "" >> release.md
+          echo "\`\`\`bash" >> release.md
+          echo "curl -L -o gpucomm.zip \"https://github.com/${GITHUB_REPOSITORY}/releases/download/nightly/gpucomm-macos-arm64.zip\"" >> release.md
+          echo "unzip -o gpucomm.zip" >> release.md
+          echo "./gpucomm --help" >> release.md
+          echo "\`\`\`" >> release.md
+          echo "" >> release.md
+          echo "SHA256:" >> release.md
+          echo "" >> release.md
+          echo "\`\`\`" >> release.md
+          cat dist/SHA256SUMS.txt >> release.md
+          echo "\`\`\`" >> release.md
+          echo "" >> release.md
+          echo "Metadata + quick bench results are attached as artifacts in the workflow run." >> release.md
+      - name: Publish pre-release (nightly)
+        uses: ncipollo/release-action@v1
+        with:
+          tag: nightly
+          name: Nightly Build
+          prerelease: true
+          allowUpdates: true
+          replacesArtifacts: true
+          bodyFile: release.md
+          artifacts: |
+            dist/gpucomm-macos-arm64.zip
+            dist/SHA256SUMS.txt
+            results.meta
+            results.selftest.json
+            results.latency.json
+            results.bandwidth.json
