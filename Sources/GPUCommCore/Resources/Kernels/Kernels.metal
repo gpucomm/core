@@ -46,3 +46,51 @@ kernel void reduce_sum_1024(
         outBuffer[0] = scratch[0];
     }
 }
+
+// Single-threadgroup exclusive scan for up to 1024 uint elements.
+// Host must dispatch exactly 512 threads in 1 threadgroup.
+kernel void scan_exclusive_u32_1024(
+    device const uint* inBuffer [[buffer(0)]],
+    device uint* outBuffer [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    threadgroup uint data[1024];
+
+    uint i0 = tid * 2u;
+    uint i1 = i0 + 1u;
+
+    data[i0] = (i0 < n) ? inBuffer[i0] : 0u;
+    data[i1] = (i1 < n) ? inBuffer[i1] : 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Up-sweep (reduce) phase.
+    for (uint stride = 1u; stride < 1024u; stride <<= 1u) {
+        uint index = ((tid + 1u) * stride * 2u) - 1u;
+        if (index < 1024u) {
+            data[index] += data[index - stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Clear the last element for exclusive scan.
+    if (tid == 0u) {
+        data[1023] = 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Down-sweep phase.
+    for (uint stride = 512u; stride >= 1u; stride >>= 1u) {
+        uint index = ((tid + 1u) * stride * 2u) - 1u;
+        if (index < 1024u) {
+            uint t = data[index - stride];
+            data[index - stride] = data[index];
+            data[index] += t;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (stride == 1u) { break; } // avoid uint underflow in loop condition
+    }
+
+    if (i0 < n) { outBuffer[i0] = data[i0]; }
+    if (i1 < n) { outBuffer[i1] = data[i1]; }
+}

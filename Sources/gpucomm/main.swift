@@ -7,12 +7,14 @@ private func usage(_ exitCode: Int32) -> Never {
 
     Usage:
       gpucomm bench bandwidth [--size-mib N] [--iters N] [--mode shared|private]
+      gpucomm bench scan [--n N] [--iters N] [--warmup N] [--json]
       gpucomm bench transfer [--size-kib N] [--iters N] [--warmup N] [--direction h2d|d2h] [--mode shared|private] [--strategy memcpy|blit] [--json]
       gpucomm run reduction [--n N]
 
     Examples:
       gpucomm bench bandwidth --size-mib 64 --iters 200 --mode shared
       gpucomm bench bandwidth --size-mib 64 --iters 200 --mode private
+      gpucomm bench scan --n 1024 --iters 200 --warmup 20
       gpucomm bench transfer --size-kib 4 --iters 10000 --warmup 100 --direction h2d --mode private --strategy blit
       gpucomm bench transfer --size-kib 4 --iters 10000 --warmup 100 --direction d2h --mode private --strategy blit --json
       gpucomm run reduction --n 1024
@@ -122,6 +124,20 @@ do {
                 mode: mode,
                 strategy: strategy
             )
+            if json {
+                print(try result.jsonLine())
+            } else {
+                print(result.prettyLine)
+            }
+
+        case "scan":
+            let n = reader.popInt(for: "--n") ?? 1024
+            let iters = reader.popInt(for: "--iters") ?? 200
+            let warmup = reader.popInt(for: "--warmup") ?? 20
+            let json = reader.popFlag("--json")
+            if !reader.isEmpty { usage(1) }
+
+            let result = try ScanBenchmark.run(context: context, kernels: kernels, n: n, iters: iters, warmup: warmup)
             if json {
                 print(try result.jsonLine())
             } else {
