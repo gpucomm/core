@@ -16,6 +16,7 @@ private func usage(_ exitCode: Int32) -> Never {
       gpucomm bench transfer [--size-kib N] [--iters N] [--warmup N] [--reps N] [--direction h2d|d2h] [--mode shared|private] [--strategy memcpy|blit] [--format human|json|csv]
       gpucomm bench transfer-sweep [--sizes-kib CSV] [--iters N] [--warmup N] [--reps N] [--direction h2d|d2h|both] [--mode shared|private|both] [--format human|jsonl|csv]
       gpucomm run reduction [--n N]
+      gpucomm selftest [--format human|json]
 
     Examples:
       gpucomm bench bandwidth --size-mib 64 --iters 200 --mode shared
@@ -31,6 +32,7 @@ private func usage(_ exitCode: Int32) -> Never {
       gpucomm bench transfer --size-kib 4 --iters 10000 --warmup 100 --direction d2h --mode private --strategy blit --format json
       gpucomm bench transfer-sweep --sizes-kib 1,4,64 --iters 5000 --warmup 200 --direction both --mode both --format jsonl
       gpucomm run reduction --n 1024
+      gpucomm selftest
     """
     print(text)
     Foundation.exit(exitCode)
@@ -57,6 +59,9 @@ if argv.first == "run" {
     if argv.count == 1 || ["-h", "--help", "help"].contains(argv[1]) {
         usage(0)
     }
+}
+if argv.first == "selftest" {
+    if argv.count > 1, ["-h", "--help", "help"].contains(argv[1]) { usage(0) }
 }
 
 guard let context = MetalContext() else {
@@ -1204,6 +1209,77 @@ do {
 
         default:
             usage(1)
+        }
+
+    case "selftest":
+        let format = OutputOptions.parse(&reader, defaultFormat: .human, jsonImplies: .json)
+        if !reader.isEmpty { usage(1) }
+
+        struct SelfTestCase {
+            let name: String
+            let ok: Bool
+            let detail: String?
+        }
+
+        func runCase(_ name: String, _ f: () throws -> Bool) -> SelfTestCase {
+            do {
+                let ok = try f()
+                return SelfTestCase(name: name, ok: ok, detail: ok ? nil : "failed")
+            } catch {
+                return SelfTestCase(name: name, ok: false, detail: String(describing: error))
+            }
+        }
+
+        let cases: [SelfTestCase] = [
+            runCase("reduction") {
+                let r = try ReductionBenchmark.run(context: context, kernels: kernels, n: 1024)
+                return abs(r.sum - r.expected) < 1e-3
+            },
+            runCase("scan") {
+                let r = try ScanBenchmark.run(context: context, kernels: kernels, n: 1024, iters: 10, warmup: 2)
+                return r.ok
+            },
+            runCase("matmul") {
+                let r = try MatmulBenchmark.run(context: context, kernels: kernels, m: 64, n: 64, k: 64, iters: 2, warmup: 1, variant: .tiled16)
+                return r.ok
+            },
+        ]
+
+        let overall = cases.allSatisfy(\.ok)
+
+        switch format {
+        case .human:
+            for c in cases {
+                if c.ok {
+                    print("selftest \(c.name): ok")
+                } else {
+                    print("selftest \(c.name): fail\(c.detail.map { " (\($0))" } ?? "")")
+                }
+            }
+            print("selftest overall: \(overall ? "ok" : "fail")")
+
+        case .json, .jsonl:
+            let obj: [String: Any] = [
+                "selftest": true,
+                "ok": overall,
+                "cases": cases.map { c in
+                    var x: [String: Any] = ["name": c.name, "ok": c.ok]
+                    if let detail = c.detail { x["detail"] = detail }
+                    return x
+                },
+            ]
+            let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+            print(String(decoding: data, as: UTF8.self))
+
+        case .csv:
+            printCSV(
+                header: ["name", "ok", "detail"],
+                rows: cases.map { c in [c.name, c.ok ? "true" : "false", c.detail ?? ""] }
+            )
+        }
+
+        if !overall {
+            Foundation.exit(2)
         }
 
     case "-h", "--help", "help":

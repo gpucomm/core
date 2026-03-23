@@ -30,6 +30,7 @@ swift build -c release
 .build/release/gpucomm bench transfer --size-kib 4 --iters 10000 --warmup 100 --direction d2h --mode private --strategy blit --format json
 .build/release/gpucomm bench transfer-sweep --sizes-kib 1,4,64 --iters 5000 --warmup 200 --direction both --mode both --format jsonl
 .build/release/gpucomm run reduction --n 1024
+.build/release/gpucomm selftest
 ```
 
 ## Layout
