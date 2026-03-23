@@ -19,6 +19,7 @@ swift build -c release
 ```bash
 .build/release/gpucomm bench bandwidth --size-mib 64 --iters 200 --mode shared
 .build/release/gpucomm bench bandwidth --size-mib 64 --iters 200 --mode private
+.build/release/gpucomm bench bandwidth-sweep --sizes-mib 1,4,16,64 --iters 200 --mode private --format jsonl
 .build/release/gpucomm bench scan --n 1024 --iters 200 --warmup 20
 .build/release/gpucomm bench scan --n 65536 --iters 50 --warmup 10
 .build/release/gpucomm bench scan-sweep --ns 1024,4096,65536,1048576 --iters 50 --warmup 10 --format jsonl

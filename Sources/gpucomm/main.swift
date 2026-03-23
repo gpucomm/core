@@ -7,6 +7,7 @@ private func usage(_ exitCode: Int32) -> Never {
 
     Usage:
       gpucomm bench bandwidth [--size-mib N] [--iters N] [--mode shared|private] [--format human|json|csv]
+      gpucomm bench bandwidth-sweep [--sizes-mib CSV] [--iters N] [--mode shared|private] [--format human|jsonl|csv]
       gpucomm bench scan [--n N] [--iters N] [--warmup N] [--format human|json|csv]
       gpucomm bench scan-sweep [--ns CSV] [--iters N] [--warmup N] [--format human|jsonl|csv]
       gpucomm bench matmul [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--variant naive|tiled8|tiled16|tiled32] [--tg-x N] [--tg-y N] [--format human|json|csv]
@@ -17,6 +18,7 @@ private func usage(_ exitCode: Int32) -> Never {
     Examples:
       gpucomm bench bandwidth --size-mib 64 --iters 200 --mode shared
       gpucomm bench bandwidth --size-mib 64 --iters 200 --mode private
+      gpucomm bench bandwidth-sweep --sizes-mib 1,4,16,64 --iters 200 --mode private --format jsonl
       gpucomm bench scan --n 1024 --iters 200 --warmup 20
       gpucomm bench scan-sweep --ns 1024,4096,65536,1048576 --iters 50 --warmup 10 --format jsonl
       gpucomm bench matmul --m 256 --n 256 --k 256 --iters 50 --warmup 10 --variant tiled16
@@ -85,6 +87,54 @@ do {
                         "\(result.gpuSeconds)",
                         "\(result.gibPerSecond)",
                     ]]
+                )
+            }
+
+        case "bandwidth-sweep":
+            let sizesCSV = reader.popValue(for: "--sizes-mib") ?? "1,4,16,64"
+            let iters = reader.popInt(for: "--iters") ?? 200
+            let modeRaw = reader.popValue(for: "--mode") ?? "private"
+            guard let mode = StorageMode(rawValue: modeRaw) else {
+                die("invalid --mode '\(modeRaw)' (expected shared|private)")
+            }
+            let format = OutputOptions.parse(&reader, defaultFormat: .human, jsonImplies: .jsonl)
+            if !reader.isEmpty { usage(1) }
+
+            let sizesMiB = sizesCSV
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .compactMap(Int.init)
+                .filter { $0 > 0 }
+            if sizesMiB.isEmpty { die("invalid --sizes-mib '\(sizesCSV)' (expected comma-separated ints)") }
+
+            let results = try sizesMiB.map { sizeMiB in
+                try BandwidthBenchmark.run(
+                    context: context,
+                    kernels: kernels,
+                    sizeBytes: sizeMiB * 1024 * 1024,
+                    iters: iters,
+                    mode: mode
+                )
+            }
+
+            switch format {
+            case .human:
+                for r in results { print(r.prettyLine) }
+            case .json, .jsonl:
+                for r in results { print(try r.jsonLine()) }
+            case .csv:
+                printCSV(
+                    header: ["bench", "mode", "size_bytes", "iters", "gpu_seconds", "gib_per_second"],
+                    rows: results.map { r in
+                        [
+                            "bandwidth",
+                            r.mode.rawValue,
+                            "\(r.sizeBytes)",
+                            "\(r.iters)",
+                            "\(r.gpuSeconds)",
+                            "\(r.gibPerSecond)",
+                        ]
+                    }
                 )
             }
 
