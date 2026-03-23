@@ -8,7 +8,7 @@ private func usage(_ exitCode: Int32) -> Never {
     Usage:
       gpucomm bench bandwidth [--size-mib N] [--iters N] [--mode shared|private]
       gpucomm bench scan [--n N] [--iters N] [--warmup N] [--json]
-      gpucomm bench matmul [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--variant naive|tiled16] [--json]
+      gpucomm bench matmul [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--variant naive|tiled8|tiled16|tiled32] [--json]
       gpucomm bench matmul-sweep [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--json]
       gpucomm bench transfer [--size-kib N] [--iters N] [--warmup N] [--direction h2d|d2h] [--mode shared|private] [--strategy memcpy|blit] [--json]
       gpucomm run reduction [--n N]
@@ -157,7 +157,7 @@ do {
             let warmup = reader.popInt(for: "--warmup") ?? 10
             let variantRaw = reader.popValue(for: "--variant") ?? "tiled16"
             guard let variant = MatmulVariant(rawValue: variantRaw) else {
-                die("invalid --variant '\(variantRaw)' (expected naive|tiled16)")
+                die("invalid --variant '\(variantRaw)' (expected naive|tiled8|tiled16|tiled32)")
             }
             let tgX = reader.popInt(for: "--tg-x")
             let tgY = reader.popInt(for: "--tg-y")
@@ -218,20 +218,22 @@ do {
                 }
             }
 
-            let tiled = try MatmulBenchmark.run(
-                context: context,
-                kernels: kernels,
-                m: m,
-                n: n,
-                k: k,
-                iters: iters,
-                warmup: warmup,
-                variant: .tiled16
-            )
-            if json {
-                print(try tiled.jsonLine())
-            } else {
-                print(tiled.prettyLine)
+            for variant in [MatmulVariant.tiled8, .tiled16, .tiled32] {
+                let tiled = try MatmulBenchmark.run(
+                    context: context,
+                    kernels: kernels,
+                    m: m,
+                    n: n,
+                    k: k,
+                    iters: iters,
+                    warmup: warmup,
+                    variant: variant
+                )
+                if json {
+                    print(try tiled.jsonLine())
+                } else {
+                    print(tiled.prettyLine)
+                }
             }
 
         default:

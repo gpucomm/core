@@ -3,7 +3,9 @@ import Metal
 
 public enum MatmulVariant: String, Sendable {
     case naive
+    case tiled8
     case tiled16
+    case tiled32
 }
 
 public struct MatmulResult: Sendable {
@@ -108,7 +110,9 @@ public enum MatmulBenchmark {
         let functionName: String
         switch variant {
         case .naive: functionName = "matmul_f32_naive"
+        case .tiled8: functionName = "matmul_f32_tiled_8"
         case .tiled16: functionName = "matmul_f32_tiled_16"
+        case .tiled32: functionName = "matmul_f32_tiled_32"
         }
         let pso = try kernels.pipeline(named: functionName)
 
@@ -163,10 +167,20 @@ public enum MatmulBenchmark {
                 let threadsPerGrid = MTLSize(width: N, height: M, depth: 1)
                 encoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
 
-            case .tiled16:
-                let tg = MTLSize(width: 16, height: 16, depth: 1)
-                let tgs = MTLSize(width: (N + 15) / 16, height: (M + 15) / 16, depth: 1)
-                encoder.dispatchThreadgroups(tgs, threadsPerThreadgroup: tg)
+            case .tiled8, .tiled16, .tiled32:
+                let tile: Int
+                switch variant {
+                case .tiled8: tile = 8
+                case .tiled16: tile = 16
+                case .tiled32: tile = 32
+                default: tile = 16
+                }
+                let threadsPerThreadgroup = MTLSize(width: tile, height: tile, depth: 1)
+                if tile * tile > pso.maxTotalThreadsPerThreadgroup {
+                    throw MatmulBenchmarkError.allocationFailed("threadgroup too large for device (tg=\(tile)x\(tile), max=\(pso.maxTotalThreadsPerThreadgroup))")
+                }
+                let threadgroupsPerGrid = MTLSize(width: (N + tile - 1) / tile, height: (M + tile - 1) / tile, depth: 1)
+                encoder.dispatchThreadgroups(threadgroupsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
             }
 
             encoder.endEncoding()

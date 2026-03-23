@@ -219,3 +219,79 @@ kernel void matmul_f32_tiled_16(
         C[row * N + col] = acc;
     }
 }
+
+kernel void matmul_f32_tiled_8(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]]
+) {
+    const uint TILE = 8u;
+    uint row = tgPos.y * TILE + tid.y;
+    uint col = tgPos.x * TILE + tid.x;
+
+    threadgroup float Asub[8][8];
+    threadgroup float Bsub[8][8];
+
+    float acc = 0.0f;
+    uint kTiles = (K + TILE - 1u) / TILE;
+    for (uint t = 0; t < kTiles; t++) {
+        uint aCol = t * TILE + tid.x;
+        uint bRow = t * TILE + tid.y;
+
+        Asub[tid.y][tid.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;
+        Bsub[tid.y][tid.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < TILE; kk++) {
+            acc += Asub[tid.y][kk] * Bsub[kk][tid.x];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}
+
+kernel void matmul_f32_tiled_32(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]]
+) {
+    const uint TILE = 32u;
+    uint row = tgPos.y * TILE + tid.y;
+    uint col = tgPos.x * TILE + tid.x;
+
+    threadgroup float Asub[32][32];
+    threadgroup float Bsub[32][32];
+
+    float acc = 0.0f;
+    uint kTiles = (K + TILE - 1u) / TILE;
+    for (uint t = 0; t < kTiles; t++) {
+        uint aCol = t * TILE + tid.x;
+        uint bRow = t * TILE + tid.y;
+
+        Asub[tid.y][tid.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;
+        Bsub[tid.y][tid.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < TILE; kk++) {
+            acc += Asub[tid.y][kk] * Bsub[kk][tid.x];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}
