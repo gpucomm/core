@@ -1,0 +1,41 @@
+name: nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Keep this lightweight; intended as a quick hardware sanity + trend signal.
+    - cron: "0 3 * * *"
+
+jobs:
+  nightly-smoke:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+      - name: Build (release)
+        run: swift build -c release
+      - name: Collect metadata
+        run: |
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "macos=$(sw_vers -productVersion)"
+            echo "xcode=$(xcodebuild -version | tr '\n' ';' | sed 's/;*$//')"
+          } > results.meta
+      - name: Selftest
+        run: ./.build/release/gpucomm selftest --format json > results.selftest.json
+      - name: Quick benches (json)
+        run: |
+          ./.build/release/gpucomm bench latency --kind kernel --iters 200 --warmup 50 --reps 3 --format json > results.latency.json
+          ./.build/release/gpucomm bench bandwidth --size-mib 16 --iters 50 --mode private --reps 3 --format json > results.bandwidth.json
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-results
+          path: |
+            results.meta
+            results.selftest.json
+            results.latency.json
+            results.bandwidth.json
+
