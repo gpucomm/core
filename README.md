@@ -8,6 +8,10 @@ Low-level GPU compute runtime for Apple Silicon, focused on memory, synchronizat
 - Kernel experiments: communication patterns + memory behavior
 - Built-in benchmarks: bandwidth, latency, scaling
 
+## Dependencies
+
+- Apple frameworks: `Metal` (compute), plus `Foundation` for CLI/utilities
+
 ## Reliability On Hardware
 
 This repo is meant to be **experiments + tests = reliability on real hardware**.
