@@ -13,6 +13,7 @@ Low-level GPU compute runtime for Apple Silicon, focused on memory, synchronizat
 ## Dependencies
 
 - Apple frameworks: `Metal` (compute), plus `Foundation` for CLI/utilities
+- License: MIT (see `LICENSE`)
 
 ## Reliability On Hardware
 
