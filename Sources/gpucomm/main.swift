@@ -13,6 +13,7 @@ private func usage(_ exitCode: Int32) -> Never {
       gpucomm bench matmul [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--variant naive|tiled8|tiled16|tiled32] [--tg-x N] [--tg-y N] [--format human|json|csv]
       gpucomm bench matmul-sweep [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--format human|jsonl|csv]
       gpucomm bench transfer [--size-kib N] [--iters N] [--warmup N] [--direction h2d|d2h] [--mode shared|private] [--strategy memcpy|blit] [--format human|json|csv]
+      gpucomm bench transfer-sweep [--sizes-kib CSV] [--iters N] [--warmup N] [--direction h2d|d2h|both] [--mode shared|private|both] [--format human|jsonl|csv]
       gpucomm run reduction [--n N]
 
     Examples:
@@ -26,6 +27,7 @@ private func usage(_ exitCode: Int32) -> Never {
       gpucomm bench matmul-sweep --m 512 --n 512 --k 512 --iters 10 --warmup 3
       gpucomm bench transfer --size-kib 4 --iters 10000 --warmup 100 --direction h2d --mode private --strategy blit
       gpucomm bench transfer --size-kib 4 --iters 10000 --warmup 100 --direction d2h --mode private --strategy blit --format json
+      gpucomm bench transfer-sweep --sizes-kib 1,4,64 --iters 5000 --warmup 200 --direction both --mode both --format jsonl
       gpucomm run reduction --n 1024
     """
     print(text)
@@ -188,6 +190,92 @@ do {
                         "\(result.bytesPerSecond)",
                         "\(result.avgMicros)",
                     ]]
+                )
+            }
+
+        case "transfer-sweep":
+            let sizesCSV = reader.popValue(for: "--sizes-kib") ?? "1,4,64"
+            let iters = reader.popInt(for: "--iters") ?? 5000
+            let warmup = reader.popInt(for: "--warmup") ?? 200
+            let directionRaw = reader.popValue(for: "--direction") ?? "both"
+            let modeRaw = reader.popValue(for: "--mode") ?? "both"
+            let format = OutputOptions.parse(&reader, defaultFormat: .human, jsonImplies: .jsonl)
+            if !reader.isEmpty { usage(1) }
+
+            let sizesKiB = sizesCSV
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .compactMap(Int.init)
+                .filter { $0 > 0 }
+            if sizesKiB.isEmpty { die("invalid --sizes-kib '\(sizesCSV)' (expected comma-separated ints)") }
+
+            let directions: [TransferDirection]
+            switch directionRaw {
+            case "h2d":
+                directions = [.h2d]
+            case "d2h":
+                directions = [.d2h]
+            case "both":
+                directions = [.h2d, .d2h]
+            default:
+                die("invalid --direction '\(directionRaw)' (expected h2d|d2h|both)")
+            }
+
+            let modes: [StorageMode]
+            switch modeRaw {
+            case "shared":
+                modes = [.shared]
+            case "private":
+                modes = [.private]
+            case "both":
+                modes = [.shared, .private]
+            default:
+                die("invalid --mode '\(modeRaw)' (expected shared|private|both)")
+            }
+
+            var results: [TransferResult] = []
+            results.reserveCapacity(sizesKiB.count * directions.count * modes.count)
+
+            for sizeKiB in sizesKiB {
+                for direction in directions {
+                    for mode in modes {
+                        let strategy: TransferStrategy = (mode == .shared) ? .memcpy : .blit
+                        results.append(try TransferBenchmark.run(
+                            context: context,
+                            sizeBytes: sizeKiB * 1024,
+                            iters: iters,
+                            warmup: warmup,
+                            direction: direction,
+                            mode: mode,
+                            strategy: strategy
+                        ))
+                    }
+                }
+            }
+
+            switch format {
+            case .human:
+                for r in results { print(r.prettyLine) }
+            case .json, .jsonl:
+                for r in results { print(try r.jsonLine()) }
+            case .csv:
+                printCSV(
+                    header: ["bench", "direction", "mode", "strategy", "size_bytes", "iters", "warmup", "wall_seconds", "gpu_seconds", "bytes_per_second", "avg_us"],
+                    rows: results.map { r in
+                        [
+                            "transfer",
+                            r.direction.rawValue,
+                            r.mode.rawValue,
+                            r.strategy.rawValue,
+                            "\(r.sizeBytes)",
+                            "\(r.iters)",
+                            "\(r.warmup)",
+                            "\(r.wallSeconds)",
+                            r.gpuSeconds.map { "\($0)" } ?? "",
+                            "\(r.bytesPerSecond)",
+                            "\(r.avgMicros)",
+                        ]
+                    }
                 )
             }
 
