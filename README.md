@@ -23,6 +23,34 @@ Caveats:
 - GitHub Actions macOS runners aren’t Apple Silicon GPUs you control, so CI can’t validate “real” Metal timings—only build + basic CLI behavior
 - “Reliability on hardware” still depends on running these benches on target machines and tracking regressions (record chip/macOS version + commit + outputs)
 
+## Repro / Reporting
+
+When you post results (issues/comments), include:
+
+- Hardware: chip + GPU (and whether on battery/low-power mode)
+- OS/tooling: macOS version + Xcode/Swift version
+- Repo state: commit SHA + command line + `--format json/jsonl` output
+
+Quick metadata + sanity check:
+
+```bash
+git rev-parse HEAD
+sw_vers
+xcodebuild -version
+system_profiler SPHardwareDataType | head -n 30
+system_profiler SPDisplaysDataType | head -n 80
+
+swift build -c release
+./.build/release/gpucomm selftest --format json
+```
+
+Example benchmark report (JSONL, p50/p95 via `--reps`):
+
+```bash
+./.build/release/gpucomm bench transfer-sweep --sizes-kib 1,4,64 --iters 5000 --warmup 200 --reps 5 --direction both --mode both --format jsonl
+./.build/release/gpucomm bench bandwidth-sweep --sizes-mib 1,4,16,64 --iters 200 --reps 5 --mode private --format jsonl
+```
+
 ## Roadmap Progress
 
 Primary tracking issue: https://github.com/gpucomm/core/issues/1
