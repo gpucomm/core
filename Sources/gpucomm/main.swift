@@ -1,27 +1,6 @@
 import Foundation
 import GPUCommCore
 
-private enum OutputFormat: String {
-    case human
-    case json
-    case jsonl
-    case csv
-}
-
-private func csvEscape(_ s: String) -> String {
-    if s.contains(",") || s.contains("\"") || s.contains("\n") || s.contains("\r") {
-        return "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\""
-    }
-    return s
-}
-
-private func printCSV(header: [String], rows: [[String]]) {
-    print(header.map(csvEscape).joined(separator: ","))
-    for row in rows {
-        print(row.map(csvEscape).joined(separator: ","))
-    }
-}
-
 private func usage(_ exitCode: Int32) -> Never {
     let text = """
     gpucomm — Metal-based GPU communication + compute experiments
@@ -29,6 +8,7 @@ private func usage(_ exitCode: Int32) -> Never {
     Usage:
       gpucomm bench bandwidth [--size-mib N] [--iters N] [--mode shared|private] [--format human|json|csv]
       gpucomm bench scan [--n N] [--iters N] [--warmup N] [--format human|json|csv]
+      gpucomm bench scan-sweep [--ns CSV] [--iters N] [--warmup N] [--format human|jsonl|csv]
       gpucomm bench matmul [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--variant naive|tiled8|tiled16|tiled32] [--tg-x N] [--tg-y N] [--format human|json|csv]
       gpucomm bench matmul-sweep [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--format human|jsonl|csv]
       gpucomm bench transfer [--size-kib N] [--iters N] [--warmup N] [--direction h2d|d2h] [--mode shared|private] [--strategy memcpy|blit] [--format human|json|csv]
@@ -38,6 +18,7 @@ private func usage(_ exitCode: Int32) -> Never {
       gpucomm bench bandwidth --size-mib 64 --iters 200 --mode shared
       gpucomm bench bandwidth --size-mib 64 --iters 200 --mode private
       gpucomm bench scan --n 1024 --iters 200 --warmup 20
+      gpucomm bench scan-sweep --ns 1024,4096,65536,1048576 --iters 50 --warmup 10 --format jsonl
       gpucomm bench matmul --m 256 --n 256 --k 256 --iters 50 --warmup 10 --variant tiled16
       gpucomm bench matmul --m 512 --n 512 --k 512 --iters 20 --warmup 5 --variant naive --tg-x 16 --tg-y 8
       gpucomm bench matmul-sweep --m 512 --n 512 --k 512 --iters 10 --warmup 3
@@ -52,48 +33,6 @@ private func usage(_ exitCode: Int32) -> Never {
 private func die(_ message: String, exitCode: Int32 = 1) -> Never {
     FileHandle.standardError.write(Data(("error: \(message)\n").utf8))
     Foundation.exit(exitCode)
-}
-
-private struct ArgReader {
-    private var args: [String]
-    private var index: Int = 0
-
-    init(_ args: [String]) { self.args = args }
-
-    var isEmpty: Bool { index >= args.count }
-
-    mutating func pop() -> String? {
-        guard index < args.count else { return nil }
-        defer { index += 1 }
-        return args[index]
-    }
-
-    mutating func popValue(for flag: String) -> String? {
-        guard index < args.count, args[index] == flag else { return nil }
-        index += 1
-        return pop()
-    }
-
-    mutating func popInt(for flag: String) -> Int? {
-        guard let value = popValue(for: flag) else { return nil }
-        return Int(value)
-    }
-
-    mutating func popFlag(_ flag: String) -> Bool {
-        guard index < args.count, args[index] == flag else { return false }
-        index += 1
-        return true
-    }
-}
-
-private func parseOutputFormat(_ reader: inout ArgReader, defaultFormat: OutputFormat, jsonImplies: OutputFormat) -> OutputFormat {
-    let formatRaw = reader.popValue(for: "--format")
-    let jsonFlag = reader.popFlag("--json")
-    if jsonFlag { return jsonImplies }
-    if let formatRaw {
-        return OutputFormat(rawValue: formatRaw) ?? defaultFormat
-    }
-    return defaultFormat
 }
 
 let argv = Array(CommandLine.arguments.dropFirst())
@@ -120,7 +59,7 @@ do {
             guard let mode = StorageMode(rawValue: modeRaw) else {
                 die("invalid --mode '\(modeRaw)' (expected shared|private)")
             }
-            let format = parseOutputFormat(&reader, defaultFormat: .human, jsonImplies: .json)
+            let format = OutputOptions.parse(&reader, defaultFormat: .human, jsonImplies: .json)
             if !reader.isEmpty { usage(1) }
 
             let result = try BandwidthBenchmark.run(
@@ -166,7 +105,7 @@ do {
             guard let strategy = TransferStrategy(rawValue: strategyRaw) else {
                 die("invalid --strategy '\(strategyRaw)' (expected memcpy|blit)")
             }
-            let format = parseOutputFormat(&reader, defaultFormat: .human, jsonImplies: .json)
+            let format = OutputOptions.parse(&reader, defaultFormat: .human, jsonImplies: .json)
             if !reader.isEmpty { usage(1) }
 
             let result = try TransferBenchmark.run(
@@ -206,7 +145,7 @@ do {
             let n = reader.popInt(for: "--n") ?? 1024
             let iters = reader.popInt(for: "--iters") ?? 200
             let warmup = reader.popInt(for: "--warmup") ?? 20
-            let format = parseOutputFormat(&reader, defaultFormat: .human, jsonImplies: .json)
+            let format = OutputOptions.parse(&reader, defaultFormat: .human, jsonImplies: .json)
             if !reader.isEmpty { usage(1) }
 
             let result = try ScanBenchmark.run(context: context, kernels: kernels, n: n, iters: iters, warmup: warmup)
@@ -231,6 +170,47 @@ do {
                 )
             }
 
+        case "scan-sweep":
+            let nsCSV = reader.popValue(for: "--ns") ?? "1024,4096,65536,1048576"
+            let iters = reader.popInt(for: "--iters") ?? 50
+            let warmup = reader.popInt(for: "--warmup") ?? 10
+            let format = OutputOptions.parse(&reader, defaultFormat: .human, jsonImplies: .jsonl)
+            if !reader.isEmpty { usage(1) }
+
+            let ns = nsCSV
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .compactMap(Int.init)
+
+            if ns.isEmpty { die("invalid --ns '\(nsCSV)' (expected comma-separated ints)") }
+
+            let results = try ns.map { n in
+                try ScanBenchmark.run(context: context, kernels: kernels, n: n, iters: iters, warmup: warmup)
+            }
+
+            switch format {
+            case .human:
+                for r in results { print(r.prettyLine) }
+            case .json, .jsonl:
+                for r in results { print(try r.jsonLine()) }
+            case .csv:
+                printCSV(
+                    header: ["bench", "n", "iters", "warmup", "gpu_seconds", "wall_seconds", "avg_us", "ok"],
+                    rows: results.map { r in
+                        [
+                            "scan",
+                            "\(r.n)",
+                            "\(r.iters)",
+                            "\(r.warmup)",
+                            "\(r.gpuSeconds)",
+                            "\(r.wallSeconds)",
+                            "\(r.avgMicros)",
+                            r.ok ? "true" : "false",
+                        ]
+                    }
+                )
+            }
+
         case "matmul":
             let m = reader.popInt(for: "--m") ?? 256
             let n = reader.popInt(for: "--n") ?? 256
@@ -243,7 +223,7 @@ do {
             }
             let tgX = reader.popInt(for: "--tg-x")
             let tgY = reader.popInt(for: "--tg-y")
-            let format = parseOutputFormat(&reader, defaultFormat: .human, jsonImplies: .json)
+            let format = OutputOptions.parse(&reader, defaultFormat: .human, jsonImplies: .json)
             if !reader.isEmpty { usage(1) }
 
             let result = try MatmulBenchmark.run(
@@ -291,7 +271,7 @@ do {
             let k = reader.popInt(for: "--k") ?? 512
             let iters = reader.popInt(for: "--iters") ?? 10
             let warmup = reader.popInt(for: "--warmup") ?? 3
-            let format = parseOutputFormat(&reader, defaultFormat: .human, jsonImplies: .jsonl)
+            let format = OutputOptions.parse(&reader, defaultFormat: .human, jsonImplies: .jsonl)
             if !reader.isEmpty { usage(1) }
 
             let candidates: [(Int, Int)] = [
