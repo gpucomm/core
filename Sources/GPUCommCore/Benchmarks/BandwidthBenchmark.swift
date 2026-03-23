@@ -19,6 +19,19 @@ public struct BandwidthResult: Sendable {
             gibPerSecond
         )
     }
+
+    public func jsonLine() throws -> String {
+        let obj: [String: Any] = [
+            "bench": "bandwidth",
+            "mode": mode.rawValue,
+            "size_bytes": sizeBytes,
+            "iters": iters,
+            "gpu_seconds": gpuSeconds,
+            "gib_per_second": gibPerSecond,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
 }
 
 public enum BandwidthBenchmark {
@@ -124,4 +137,3 @@ public enum BandwidthBenchmark {
         )
     }
 }
-

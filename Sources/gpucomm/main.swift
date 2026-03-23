@@ -1,16 +1,37 @@
 import Foundation
 import GPUCommCore
 
+private enum OutputFormat: String {
+    case human
+    case json
+    case jsonl
+    case csv
+}
+
+private func csvEscape(_ s: String) -> String {
+    if s.contains(",") || s.contains("\"") || s.contains("\n") || s.contains("\r") {
+        return "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+    }
+    return s
+}
+
+private func printCSV(header: [String], rows: [[String]]) {
+    print(header.map(csvEscape).joined(separator: ","))
+    for row in rows {
+        print(row.map(csvEscape).joined(separator: ","))
+    }
+}
+
 private func usage(_ exitCode: Int32) -> Never {
     let text = """
     gpucomm — Metal-based GPU communication + compute experiments
 
     Usage:
-      gpucomm bench bandwidth [--size-mib N] [--iters N] [--mode shared|private]
-      gpucomm bench scan [--n N] [--iters N] [--warmup N] [--json]
-      gpucomm bench matmul [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--variant naive|tiled8|tiled16|tiled32] [--json]
-      gpucomm bench matmul-sweep [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--json]
-      gpucomm bench transfer [--size-kib N] [--iters N] [--warmup N] [--direction h2d|d2h] [--mode shared|private] [--strategy memcpy|blit] [--json]
+      gpucomm bench bandwidth [--size-mib N] [--iters N] [--mode shared|private] [--format human|json|csv]
+      gpucomm bench scan [--n N] [--iters N] [--warmup N] [--format human|json|csv]
+      gpucomm bench matmul [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--variant naive|tiled8|tiled16|tiled32] [--tg-x N] [--tg-y N] [--format human|json|csv]
+      gpucomm bench matmul-sweep [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--format human|jsonl|csv]
+      gpucomm bench transfer [--size-kib N] [--iters N] [--warmup N] [--direction h2d|d2h] [--mode shared|private] [--strategy memcpy|blit] [--format human|json|csv]
       gpucomm run reduction [--n N]
 
     Examples:
@@ -21,7 +42,7 @@ private func usage(_ exitCode: Int32) -> Never {
       gpucomm bench matmul --m 512 --n 512 --k 512 --iters 20 --warmup 5 --variant naive --tg-x 16 --tg-y 8
       gpucomm bench matmul-sweep --m 512 --n 512 --k 512 --iters 10 --warmup 3
       gpucomm bench transfer --size-kib 4 --iters 10000 --warmup 100 --direction h2d --mode private --strategy blit
-      gpucomm bench transfer --size-kib 4 --iters 10000 --warmup 100 --direction d2h --mode private --strategy blit --json
+      gpucomm bench transfer --size-kib 4 --iters 10000 --warmup 100 --direction d2h --mode private --strategy blit --format json
       gpucomm run reduction --n 1024
     """
     print(text)
@@ -65,6 +86,16 @@ private struct ArgReader {
     }
 }
 
+private func parseOutputFormat(_ reader: inout ArgReader, defaultFormat: OutputFormat, jsonImplies: OutputFormat) -> OutputFormat {
+    let formatRaw = reader.popValue(for: "--format")
+    let jsonFlag = reader.popFlag("--json")
+    if jsonFlag { return jsonImplies }
+    if let formatRaw {
+        return OutputFormat(rawValue: formatRaw) ?? defaultFormat
+    }
+    return defaultFormat
+}
+
 let argv = Array(CommandLine.arguments.dropFirst())
 if argv.isEmpty { usage(0) }
 
@@ -89,6 +120,7 @@ do {
             guard let mode = StorageMode(rawValue: modeRaw) else {
                 die("invalid --mode '\(modeRaw)' (expected shared|private)")
             }
+            let format = parseOutputFormat(&reader, defaultFormat: .human, jsonImplies: .json)
             if !reader.isEmpty { usage(1) }
 
             let result = try BandwidthBenchmark.run(
@@ -98,7 +130,24 @@ do {
                 iters: iters,
                 mode: mode
             )
-            print(result.prettyLine)
+            switch format {
+            case .human:
+                print(result.prettyLine)
+            case .json, .jsonl:
+                print(try result.jsonLine())
+            case .csv:
+                printCSV(
+                    header: ["bench", "mode", "size_bytes", "iters", "gpu_seconds", "gib_per_second"],
+                    rows: [[
+                        "bandwidth",
+                        mode.rawValue,
+                        "\(result.sizeBytes)",
+                        "\(result.iters)",
+                        "\(result.gpuSeconds)",
+                        "\(result.gibPerSecond)",
+                    ]]
+                )
+            }
 
         case "transfer":
             let sizeKiB = reader.popInt(for: "--size-kib") ?? 4
@@ -117,7 +166,7 @@ do {
             guard let strategy = TransferStrategy(rawValue: strategyRaw) else {
                 die("invalid --strategy '\(strategyRaw)' (expected memcpy|blit)")
             }
-            let json = reader.popFlag("--json")
+            let format = parseOutputFormat(&reader, defaultFormat: .human, jsonImplies: .json)
             if !reader.isEmpty { usage(1) }
 
             let result = try TransferBenchmark.run(
@@ -129,24 +178,57 @@ do {
                 mode: mode,
                 strategy: strategy
             )
-            if json {
-                print(try result.jsonLine())
-            } else {
+            switch format {
+            case .human:
                 print(result.prettyLine)
+            case .json, .jsonl:
+                print(try result.jsonLine())
+            case .csv:
+                printCSV(
+                    header: ["bench", "direction", "mode", "strategy", "size_bytes", "iters", "warmup", "wall_seconds", "gpu_seconds", "bytes_per_second", "avg_us"],
+                    rows: [[
+                        "transfer",
+                        direction.rawValue,
+                        mode.rawValue,
+                        strategy.rawValue,
+                        "\(result.sizeBytes)",
+                        "\(result.iters)",
+                        "\(result.warmup)",
+                        "\(result.wallSeconds)",
+                        result.gpuSeconds.map { "\($0)" } ?? "",
+                        "\(result.bytesPerSecond)",
+                        "\(result.avgMicros)",
+                    ]]
+                )
             }
 
         case "scan":
             let n = reader.popInt(for: "--n") ?? 1024
             let iters = reader.popInt(for: "--iters") ?? 200
             let warmup = reader.popInt(for: "--warmup") ?? 20
-            let json = reader.popFlag("--json")
+            let format = parseOutputFormat(&reader, defaultFormat: .human, jsonImplies: .json)
             if !reader.isEmpty { usage(1) }
 
             let result = try ScanBenchmark.run(context: context, kernels: kernels, n: n, iters: iters, warmup: warmup)
-            if json {
-                print(try result.jsonLine())
-            } else {
+            switch format {
+            case .human:
                 print(result.prettyLine)
+            case .json, .jsonl:
+                print(try result.jsonLine())
+            case .csv:
+                printCSV(
+                    header: ["bench", "n", "iters", "warmup", "gpu_seconds", "wall_seconds", "avg_us", "ok"],
+                    rows: [[
+                        "scan",
+                        "\(result.n)",
+                        "\(result.iters)",
+                        "\(result.warmup)",
+                        "\(result.gpuSeconds)",
+                        "\(result.wallSeconds)",
+                        "\(result.avgMicros)",
+                        result.ok ? "true" : "false",
+                    ]]
+                )
             }
 
         case "matmul":
@@ -161,7 +243,7 @@ do {
             }
             let tgX = reader.popInt(for: "--tg-x")
             let tgY = reader.popInt(for: "--tg-y")
-            let json = reader.popFlag("--json")
+            let format = parseOutputFormat(&reader, defaultFormat: .human, jsonImplies: .json)
             if !reader.isEmpty { usage(1) }
 
             let result = try MatmulBenchmark.run(
@@ -176,10 +258,31 @@ do {
                 tgX: tgX,
                 tgY: tgY
             )
-            if json {
-                print(try result.jsonLine())
-            } else {
+            switch format {
+            case .human:
                 print(result.prettyLine)
+            case .json, .jsonl:
+                print(try result.jsonLine())
+            case .csv:
+                printCSV(
+                    header: ["bench", "variant", "tg_x", "tg_y", "m", "n", "k", "iters", "warmup", "gpu_seconds", "wall_seconds", "avg_us", "gflops", "ok"],
+                    rows: [[
+                        "matmul",
+                        result.variant.rawValue,
+                        result.tgX.map { "\($0)" } ?? "",
+                        result.tgY.map { "\($0)" } ?? "",
+                        "\(result.m)",
+                        "\(result.n)",
+                        "\(result.k)",
+                        "\(result.iters)",
+                        "\(result.warmup)",
+                        "\(result.gpuSeconds)",
+                        "\(result.wallSeconds)",
+                        "\(result.avgMicros)",
+                        "\(result.gflops)",
+                        result.ok ? "true" : "false",
+                    ]]
+                )
             }
 
         case "matmul-sweep":
@@ -188,7 +291,7 @@ do {
             let k = reader.popInt(for: "--k") ?? 512
             let iters = reader.popInt(for: "--iters") ?? 10
             let warmup = reader.popInt(for: "--warmup") ?? 3
-            let json = reader.popFlag("--json")
+            let format = parseOutputFormat(&reader, defaultFormat: .human, jsonImplies: .jsonl)
             if !reader.isEmpty { usage(1) }
 
             let candidates: [(Int, Int)] = [
@@ -198,8 +301,11 @@ do {
                 (32, 8),
             ]
 
+            var results: [MatmulResult] = []
+            results.reserveCapacity(candidates.count + 3)
+
             for (x, y) in candidates {
-                let result = try MatmulBenchmark.run(
+                results.append(try MatmulBenchmark.run(
                     context: context,
                     kernels: kernels,
                     m: m,
@@ -210,16 +316,11 @@ do {
                     variant: .naive,
                     tgX: x,
                     tgY: y
-                )
-                if json {
-                    print(try result.jsonLine())
-                } else {
-                    print(result.prettyLine)
-                }
+                ))
             }
 
             for variant in [MatmulVariant.tiled8, .tiled16, .tiled32] {
-                let tiled = try MatmulBenchmark.run(
+                results.append(try MatmulBenchmark.run(
                     context: context,
                     kernels: kernels,
                     m: m,
@@ -228,12 +329,36 @@ do {
                     iters: iters,
                     warmup: warmup,
                     variant: variant
+                ))
+            }
+
+            switch format {
+            case .human:
+                for r in results { print(r.prettyLine) }
+            case .jsonl, .json:
+                for r in results { print(try r.jsonLine()) }
+            case .csv:
+                printCSV(
+                    header: ["bench", "variant", "tg_x", "tg_y", "m", "n", "k", "iters", "warmup", "gpu_seconds", "wall_seconds", "avg_us", "gflops", "ok"],
+                    rows: results.map { r in
+                        [
+                            "matmul",
+                            r.variant.rawValue,
+                            r.tgX.map { "\($0)" } ?? "",
+                            r.tgY.map { "\($0)" } ?? "",
+                            "\(r.m)",
+                            "\(r.n)",
+                            "\(r.k)",
+                            "\(r.iters)",
+                            "\(r.warmup)",
+                            "\(r.gpuSeconds)",
+                            "\(r.wallSeconds)",
+                            "\(r.avgMicros)",
+                            "\(r.gflops)",
+                            r.ok ? "true" : "false",
+                        ]
+                    }
                 )
-                if json {
-                    print(try tiled.jsonLine())
-                } else {
-                    print(tiled.prettyLine)
-                }
             }
 
         default:
