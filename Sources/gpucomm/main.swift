@@ -9,6 +9,7 @@ private func usage(_ exitCode: Int32) -> Never {
       gpucomm bench bandwidth [--size-mib N] [--iters N] [--mode shared|private]
       gpucomm bench scan [--n N] [--iters N] [--warmup N] [--json]
       gpucomm bench matmul [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--variant naive|tiled16] [--json]
+      gpucomm bench matmul-sweep [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--json]
       gpucomm bench transfer [--size-kib N] [--iters N] [--warmup N] [--direction h2d|d2h] [--mode shared|private] [--strategy memcpy|blit] [--json]
       gpucomm run reduction [--n N]
 
@@ -17,6 +18,8 @@ private func usage(_ exitCode: Int32) -> Never {
       gpucomm bench bandwidth --size-mib 64 --iters 200 --mode private
       gpucomm bench scan --n 1024 --iters 200 --warmup 20
       gpucomm bench matmul --m 256 --n 256 --k 256 --iters 50 --warmup 10 --variant tiled16
+      gpucomm bench matmul --m 512 --n 512 --k 512 --iters 20 --warmup 5 --variant naive --tg-x 16 --tg-y 8
+      gpucomm bench matmul-sweep --m 512 --n 512 --k 512 --iters 10 --warmup 3
       gpucomm bench transfer --size-kib 4 --iters 10000 --warmup 100 --direction h2d --mode private --strategy blit
       gpucomm bench transfer --size-kib 4 --iters 10000 --warmup 100 --direction d2h --mode private --strategy blit --json
       gpucomm run reduction --n 1024
@@ -156,6 +159,8 @@ do {
             guard let variant = MatmulVariant(rawValue: variantRaw) else {
                 die("invalid --variant '\(variantRaw)' (expected naive|tiled16)")
             }
+            let tgX = reader.popInt(for: "--tg-x")
+            let tgY = reader.popInt(for: "--tg-y")
             let json = reader.popFlag("--json")
             if !reader.isEmpty { usage(1) }
 
@@ -167,12 +172,66 @@ do {
                 k: k,
                 iters: iters,
                 warmup: warmup,
-                variant: variant
+                variant: variant,
+                tgX: tgX,
+                tgY: tgY
             )
             if json {
                 print(try result.jsonLine())
             } else {
                 print(result.prettyLine)
+            }
+
+        case "matmul-sweep":
+            let m = reader.popInt(for: "--m") ?? 512
+            let n = reader.popInt(for: "--n") ?? 512
+            let k = reader.popInt(for: "--k") ?? 512
+            let iters = reader.popInt(for: "--iters") ?? 10
+            let warmup = reader.popInt(for: "--warmup") ?? 3
+            let json = reader.popFlag("--json")
+            if !reader.isEmpty { usage(1) }
+
+            let candidates: [(Int, Int)] = [
+                (8, 8),
+                (16, 8),
+                (16, 16),
+                (32, 8),
+            ]
+
+            for (x, y) in candidates {
+                let result = try MatmulBenchmark.run(
+                    context: context,
+                    kernels: kernels,
+                    m: m,
+                    n: n,
+                    k: k,
+                    iters: iters,
+                    warmup: warmup,
+                    variant: .naive,
+                    tgX: x,
+                    tgY: y
+                )
+                if json {
+                    print(try result.jsonLine())
+                } else {
+                    print(result.prettyLine)
+                }
+            }
+
+            let tiled = try MatmulBenchmark.run(
+                context: context,
+                kernels: kernels,
+                m: m,
+                n: n,
+                k: k,
+                iters: iters,
+                warmup: warmup,
+                variant: .tiled16
+            )
+            if json {
+                print(try tiled.jsonLine())
+            } else {
+                print(tiled.prettyLine)
             }
 
         default:

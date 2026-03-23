@@ -22,6 +22,7 @@ swift build -c release
 .build/release/gpucomm bench scan --n 1024 --iters 200 --warmup 20
 .build/release/gpucomm bench scan --n 65536 --iters 50 --warmup 10
 .build/release/gpucomm bench matmul --m 256 --n 256 --k 256 --iters 50 --warmup 10 --variant tiled16
+.build/release/gpucomm bench matmul-sweep --m 512 --n 512 --k 512 --iters 10 --warmup 3
 .build/release/gpucomm bench transfer --size-kib 4 --iters 10000 --warmup 100 --direction h2d --mode private --strategy blit
 .build/release/gpucomm bench transfer --size-kib 4 --iters 10000 --warmup 100 --direction d2h --mode private --strategy blit --json
 .build/release/gpucomm run reduction --n 1024

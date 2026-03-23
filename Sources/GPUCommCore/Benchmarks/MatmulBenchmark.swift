@@ -8,6 +8,8 @@ public enum MatmulVariant: String, Sendable {
 
 public struct MatmulResult: Sendable {
     public let variant: MatmulVariant
+    public let tgX: Int?
+    public let tgY: Int?
     public let m: Int
     public let n: Int
     public let k: Int
@@ -26,9 +28,13 @@ public struct MatmulResult: Sendable {
     public var avgMicros: Double { (wallSeconds / Double(max(1, iters))) * 1_000_000.0 }
 
     public var prettyLine: String {
+        var head = "matmul var=\(variant.rawValue)"
+        if let tgX, let tgY {
+            head += " tg=\(tgX)x\(tgY)"
+        }
         return String(
-            format: "matmul var=%@ m=%d n=%d k=%d iters=%d gpu=%.3fms wall=%.3fms avg=%.3fus gflops=%.2f ok=%@",
-            variant.rawValue,
+            format: "%@ m=%d n=%d k=%d iters=%d gpu=%.3fms wall=%.3fms avg=%.3fus gflops=%.2f ok=%@",
+            head,
             m, n, k,
             iters,
             gpuSeconds * 1000.0,
@@ -40,7 +46,7 @@ public struct MatmulResult: Sendable {
     }
 
     public func jsonLine() throws -> String {
-        let obj: [String: Any] = [
+        var obj: [String: Any] = [
             "bench": "matmul",
             "variant": variant.rawValue,
             "m": m,
@@ -54,6 +60,10 @@ public struct MatmulResult: Sendable {
             "gflops": gflops,
             "ok": ok,
         ]
+        if let tgX, let tgY {
+            obj["tg_x"] = tgX
+            obj["tg_y"] = tgY
+        }
         let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
         return String(decoding: data, as: UTF8.self)
     }
@@ -85,7 +95,9 @@ public enum MatmulBenchmark {
         k: Int,
         iters: Int,
         warmup: Int,
-        variant: MatmulVariant
+        variant: MatmulVariant,
+        tgX: Int? = nil,
+        tgY: Int? = nil
     ) throws -> MatmulResult {
         let M = max(1, m)
         let N = max(1, n)
@@ -142,7 +154,12 @@ public enum MatmulBenchmark {
 
             switch variant {
             case .naive:
-                let threadsPerThreadgroup = MTLSize(width: 16, height: 16, depth: 1)
+                let x = max(1, tgX ?? 16)
+                let y = max(1, tgY ?? 16)
+                let threadsPerThreadgroup = MTLSize(width: x, height: y, depth: 1)
+                if x * y > pso.maxTotalThreadsPerThreadgroup {
+                    throw MatmulBenchmarkError.allocationFailed("threadgroup too large for device (tg=\(x)x\(y), max=\(pso.maxTotalThreadsPerThreadgroup))")
+                }
                 let threadsPerGrid = MTLSize(width: N, height: M, depth: 1)
                 encoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
 
@@ -178,6 +195,8 @@ public enum MatmulBenchmark {
         let ok = verifySmallIfNeeded(a: aPtr, b: bPtr, c: cBuf, m: M, n: N, k: K)
         return MatmulResult(
             variant: variant,
+            tgX: (variant == .naive ? (tgX ?? 16) : nil),
+            tgY: (variant == .naive ? (tgY ?? 16) : nil),
             m: M, n: N, k: K,
             iters: clampedIters,
             warmup: clampedWarmup,
@@ -207,4 +226,3 @@ public enum MatmulBenchmark {
         return true
     }
 }
-
