@@ -6,13 +6,13 @@ private func usage(_ exitCode: Int32) -> Never {
     gpucomm — Metal-based GPU communication + compute experiments
 
     Usage:
-      gpucomm bench bandwidth [--size-mib N] [--iters N] [--mode shared|private] [--format human|json|csv]
+      gpucomm bench bandwidth [--size-mib N] [--iters N] [--mode shared|private] [--reps N] [--format human|json|csv]
       gpucomm bench bandwidth-sweep [--sizes-mib CSV] [--iters N] [--mode shared|private] [--reps N] [--format human|jsonl|csv]
-      gpucomm bench scan [--n N] [--iters N] [--warmup N] [--format human|json|csv]
+      gpucomm bench scan [--n N] [--iters N] [--warmup N] [--reps N] [--format human|json|csv]
       gpucomm bench scan-sweep [--ns CSV] [--iters N] [--warmup N] [--reps N] [--format human|jsonl|csv]
-      gpucomm bench matmul [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--variant naive|tiled8|tiled16|tiled32] [--tg-x N] [--tg-y N] [--format human|json|csv]
+      gpucomm bench matmul [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--reps N] [--variant naive|tiled8|tiled16|tiled32] [--tg-x N] [--tg-y N] [--format human|json|csv]
       gpucomm bench matmul-sweep [--m N] [--n N] [--k N] [--iters N] [--warmup N] [--reps N] [--format human|jsonl|csv]
-      gpucomm bench transfer [--size-kib N] [--iters N] [--warmup N] [--direction h2d|d2h] [--mode shared|private] [--strategy memcpy|blit] [--format human|json|csv]
+      gpucomm bench transfer [--size-kib N] [--iters N] [--warmup N] [--reps N] [--direction h2d|d2h] [--mode shared|private] [--strategy memcpy|blit] [--format human|json|csv]
       gpucomm bench transfer-sweep [--sizes-kib CSV] [--iters N] [--warmup N] [--reps N] [--direction h2d|d2h|both] [--mode shared|private|both] [--format human|jsonl|csv]
       gpucomm run reduction [--n N]
 
@@ -60,36 +60,104 @@ do {
             let sizeMiB = reader.popInt(for: "--size-mib") ?? 64
             let iters = reader.popInt(for: "--iters") ?? 200
             let modeRaw = reader.popValue(for: "--mode") ?? "shared"
+            let reps = reader.popInt(for: "--reps") ?? 1
             guard let mode = StorageMode(rawValue: modeRaw) else {
                 die("invalid --mode '\(modeRaw)' (expected shared|private)")
             }
             let format = OutputOptions.parse(&reader, defaultFormat: .human, jsonImplies: .json)
             if !reader.isEmpty { usage(1) }
 
-            let result = try BandwidthBenchmark.run(
-                context: context,
-                kernels: kernels,
-                sizeBytes: sizeMiB * 1024 * 1024,
-                iters: iters,
-                mode: mode
-            )
-            switch format {
-            case .human:
-                print(result.prettyLine)
-            case .json, .jsonl:
-                print(try result.jsonLine())
-            case .csv:
-                printCSV(
-                    header: ["bench", "mode", "size_bytes", "iters", "gpu_seconds", "gib_per_second"],
-                    rows: [[
-                        "bandwidth",
-                        mode.rawValue,
-                        "\(result.sizeBytes)",
-                        "\(result.iters)",
-                        "\(result.gpuSeconds)",
-                        "\(result.gibPerSecond)",
-                    ]]
+            let clampedReps = max(1, reps)
+            if clampedReps == 1 {
+                let result = try BandwidthBenchmark.run(
+                    context: context,
+                    kernels: kernels,
+                    sizeBytes: sizeMiB * 1024 * 1024,
+                    iters: iters,
+                    mode: mode
                 )
+                switch format {
+                case .human:
+                    print(result.prettyLine)
+                case .json, .jsonl:
+                    print(try result.jsonLine())
+                case .csv:
+                    printCSV(
+                        header: ["bench", "mode", "size_bytes", "iters", "gpu_seconds", "gib_per_second"],
+                        rows: [[
+                            "bandwidth",
+                            mode.rawValue,
+                            "\(result.sizeBytes)",
+                            "\(result.iters)",
+                            "\(result.gpuSeconds)",
+                            "\(result.gibPerSecond)",
+                        ]]
+                    )
+                }
+            } else {
+                var gibpsSamples: [Double] = []
+                var gpuMsSamples: [Double] = []
+                gibpsSamples.reserveCapacity(clampedReps)
+                gpuMsSamples.reserveCapacity(clampedReps)
+                for _ in 0..<clampedReps {
+                    let r = try BandwidthBenchmark.run(
+                        context: context,
+                        kernels: kernels,
+                        sizeBytes: sizeMiB * 1024 * 1024,
+                        iters: iters,
+                        mode: mode
+                    )
+                    gibpsSamples.append(r.gibPerSecond)
+                    gpuMsSamples.append(r.gpuSeconds * 1000.0)
+                }
+                let gibps = Stats.summarize(gibpsSamples)
+                let gpuMs = Stats.summarize(gpuMsSamples)
+                let sizeBytes = sizeMiB * 1024 * 1024
+
+                switch format {
+                case .human:
+                    let mib = Double(sizeBytes) / (1024.0 * 1024.0)
+                    print(String(
+                        format: "bandwidth mode=%@ size=%.1fMiB iters=%d reps=%d gibps_p50=%.2f gibps_p95=%.2f gpu_ms_p50=%.3f gpu_ms_p95=%.3f",
+                        mode.rawValue,
+                        mib,
+                        iters,
+                        gibps.count,
+                        gibps.p50,
+                        gibps.p95,
+                        gpuMs.p50,
+                        gpuMs.p95
+                    ))
+                case .json, .jsonl:
+                    let obj: [String: Any] = [
+                        "bench": "bandwidth",
+                        "mode": mode.rawValue,
+                        "size_bytes": sizeBytes,
+                        "iters": iters,
+                        "reps": gibps.count,
+                        "gib_per_second_p50": gibps.p50,
+                        "gib_per_second_p95": gibps.p95,
+                        "gpu_ms_p50": gpuMs.p50,
+                        "gpu_ms_p95": gpuMs.p95,
+                    ]
+                    let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+                    print(String(decoding: data, as: UTF8.self))
+                case .csv:
+                    printCSV(
+                        header: ["bench", "mode", "size_bytes", "iters", "reps", "gibps_p50", "gibps_p95", "gpu_ms_p50", "gpu_ms_p95"],
+                        rows: [[
+                            "bandwidth",
+                            mode.rawValue,
+                            "\(sizeBytes)",
+                            "\(iters)",
+                            "\(gibps.count)",
+                            "\(gibps.p50)",
+                            "\(gibps.p95)",
+                            "\(gpuMs.p50)",
+                            "\(gpuMs.p95)",
+                        ]]
+                    )
+                }
             }
 
         case "bandwidth-sweep":
@@ -201,6 +269,7 @@ do {
             let sizeKiB = reader.popInt(for: "--size-kib") ?? 4
             let iters = reader.popInt(for: "--iters") ?? 10_000
             let warmup = reader.popInt(for: "--warmup") ?? 100
+            let reps = reader.popInt(for: "--reps") ?? 1
             let directionRaw = reader.popValue(for: "--direction") ?? "h2d"
             let modeRaw = reader.popValue(for: "--mode") ?? "private"
             guard let direction = TransferDirection(rawValue: directionRaw) else {
@@ -217,37 +286,128 @@ do {
             let format = OutputOptions.parse(&reader, defaultFormat: .human, jsonImplies: .json)
             if !reader.isEmpty { usage(1) }
 
-            let result = try TransferBenchmark.run(
-                context: context,
-                sizeBytes: sizeKiB * 1024,
-                iters: iters,
-                warmup: warmup,
-                direction: direction,
-                mode: mode,
-                strategy: strategy
-            )
-            switch format {
-            case .human:
-                print(result.prettyLine)
-            case .json, .jsonl:
-                print(try result.jsonLine())
-            case .csv:
-                printCSV(
-                    header: ["bench", "direction", "mode", "strategy", "size_bytes", "iters", "warmup", "wall_seconds", "gpu_seconds", "bytes_per_second", "avg_us"],
-                    rows: [[
-                        "transfer",
+            let clampedReps = max(1, reps)
+            if clampedReps == 1 {
+                let result = try TransferBenchmark.run(
+                    context: context,
+                    sizeBytes: sizeKiB * 1024,
+                    iters: iters,
+                    warmup: warmup,
+                    direction: direction,
+                    mode: mode,
+                    strategy: strategy
+                )
+                switch format {
+                case .human:
+                    print(result.prettyLine)
+                case .json, .jsonl:
+                    print(try result.jsonLine())
+                case .csv:
+                    printCSV(
+                        header: ["bench", "direction", "mode", "strategy", "size_bytes", "iters", "warmup", "wall_seconds", "gpu_seconds", "bytes_per_second", "avg_us"],
+                        rows: [[
+                            "transfer",
+                            direction.rawValue,
+                            mode.rawValue,
+                            strategy.rawValue,
+                            "\(result.sizeBytes)",
+                            "\(result.iters)",
+                            "\(result.warmup)",
+                            "\(result.wallSeconds)",
+                            result.gpuSeconds.map { "\($0)" } ?? "",
+                            "\(result.bytesPerSecond)",
+                            "\(result.avgMicros)",
+                        ]]
+                    )
+                }
+            } else {
+                var avgSamples: [Double] = []
+                var bpsSamples: [Double] = []
+                var gpuMsSamples: [Double] = []
+                avgSamples.reserveCapacity(clampedReps)
+                bpsSamples.reserveCapacity(clampedReps)
+                gpuMsSamples.reserveCapacity(clampedReps)
+
+                for _ in 0..<clampedReps {
+                    let r = try TransferBenchmark.run(
+                        context: context,
+                        sizeBytes: sizeKiB * 1024,
+                        iters: iters,
+                        warmup: warmup,
+                        direction: direction,
+                        mode: mode,
+                        strategy: strategy
+                    )
+                    avgSamples.append(r.avgMicros)
+                    bpsSamples.append(r.bytesPerSecond)
+                    if let g = r.gpuSeconds { gpuMsSamples.append(g * 1000.0) }
+                }
+
+                let avgUs = Stats.summarize(avgSamples)
+                let bps = Stats.summarize(bpsSamples)
+                let gpuMs = gpuMsSamples.isEmpty ? nil : Stats.summarize(gpuMsSamples)
+                let sizeBytes = sizeKiB * 1024
+
+                switch format {
+                case .human:
+                    let kib = Double(sizeBytes) / 1024.0
+                    print(String(
+                        format: "transfer dir=%@ mode=%@ strategy=%@ size=%.1fKiB iters=%d warmup=%d reps=%d avg_us_p50=%.3f avg_us_p95=%.3f bps_p50=%.0f bps_p95=%.0f%@",
                         direction.rawValue,
                         mode.rawValue,
                         strategy.rawValue,
-                        "\(result.sizeBytes)",
-                        "\(result.iters)",
-                        "\(result.warmup)",
-                        "\(result.wallSeconds)",
-                        result.gpuSeconds.map { "\($0)" } ?? "",
-                        "\(result.bytesPerSecond)",
-                        "\(result.avgMicros)",
-                    ]]
-                )
+                        kib,
+                        iters,
+                        warmup,
+                        avgUs.count,
+                        avgUs.p50,
+                        avgUs.p95,
+                        bps.p50,
+                        bps.p95,
+                        gpuMs.map { String(format: " gpu_ms_p50=%.3f gpu_ms_p95=%.3f", $0.p50, $0.p95) } ?? ""
+                    ))
+                case .json, .jsonl:
+                    var obj: [String: Any] = [
+                        "bench": "transfer",
+                        "direction": direction.rawValue,
+                        "mode": mode.rawValue,
+                        "strategy": strategy.rawValue,
+                        "size_bytes": sizeBytes,
+                        "iters": iters,
+                        "warmup": warmup,
+                        "reps": avgUs.count,
+                        "avg_us_p50": avgUs.p50,
+                        "avg_us_p95": avgUs.p95,
+                        "bytes_per_second_p50": bps.p50,
+                        "bytes_per_second_p95": bps.p95,
+                    ]
+                    if let g = gpuMs {
+                        obj["gpu_ms_p50"] = g.p50
+                        obj["gpu_ms_p95"] = g.p95
+                    }
+                    let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+                    print(String(decoding: data, as: UTF8.self))
+                case .csv:
+                    printCSV(
+                        header: ["bench", "direction", "mode", "strategy", "size_bytes", "iters", "warmup", "reps", "avg_us_p50", "avg_us_p95", "bytes_per_second_p50", "bytes_per_second_p95", "gpu_ms_p50", "gpu_ms_p95"],
+                        rows: [[
+                            "transfer",
+                            direction.rawValue,
+                            mode.rawValue,
+                            strategy.rawValue,
+                            "\(sizeBytes)",
+                            "\(iters)",
+                            "\(warmup)",
+                            "\(avgUs.count)",
+                            "\(avgUs.p50)",
+                            "\(avgUs.p95)",
+                            "\(bps.p50)",
+                            "\(bps.p95)",
+                            gpuMs.map { "\($0.p50)" } ?? "",
+                            gpuMs.map { "\($0.p95)" } ?? "",
+                        ]]
+                    )
+                }
             }
 
         case "transfer-sweep":
@@ -423,29 +583,97 @@ do {
             let n = reader.popInt(for: "--n") ?? 1024
             let iters = reader.popInt(for: "--iters") ?? 200
             let warmup = reader.popInt(for: "--warmup") ?? 20
+            let reps = reader.popInt(for: "--reps") ?? 1
             let format = OutputOptions.parse(&reader, defaultFormat: .human, jsonImplies: .json)
             if !reader.isEmpty { usage(1) }
 
-            let result = try ScanBenchmark.run(context: context, kernels: kernels, n: n, iters: iters, warmup: warmup)
-            switch format {
-            case .human:
-                print(result.prettyLine)
-            case .json, .jsonl:
-                print(try result.jsonLine())
-            case .csv:
-                printCSV(
-                    header: ["bench", "n", "iters", "warmup", "gpu_seconds", "wall_seconds", "avg_us", "ok"],
-                    rows: [[
-                        "scan",
-                        "\(result.n)",
-                        "\(result.iters)",
-                        "\(result.warmup)",
-                        "\(result.gpuSeconds)",
-                        "\(result.wallSeconds)",
-                        "\(result.avgMicros)",
-                        result.ok ? "true" : "false",
-                    ]]
-                )
+            let clampedReps = max(1, reps)
+            if clampedReps == 1 {
+                let result = try ScanBenchmark.run(context: context, kernels: kernels, n: n, iters: iters, warmup: warmup)
+                switch format {
+                case .human:
+                    print(result.prettyLine)
+                case .json, .jsonl:
+                    print(try result.jsonLine())
+                case .csv:
+                    printCSV(
+                        header: ["bench", "n", "iters", "warmup", "gpu_seconds", "wall_seconds", "avg_us", "ok"],
+                        rows: [[
+                            "scan",
+                            "\(result.n)",
+                            "\(result.iters)",
+                            "\(result.warmup)",
+                            "\(result.gpuSeconds)",
+                            "\(result.wallSeconds)",
+                            "\(result.avgMicros)",
+                            result.ok ? "true" : "false",
+                        ]]
+                    )
+                }
+            } else {
+                var avgSamples: [Double] = []
+                var gpuMsSamples: [Double] = []
+                avgSamples.reserveCapacity(clampedReps)
+                gpuMsSamples.reserveCapacity(clampedReps)
+                var okAll = true
+
+                for _ in 0..<clampedReps {
+                    let r = try ScanBenchmark.run(context: context, kernels: kernels, n: n, iters: iters, warmup: warmup)
+                    avgSamples.append(r.avgMicros)
+                    gpuMsSamples.append(r.gpuSeconds * 1000.0)
+                    okAll = okAll && r.ok
+                }
+
+                let avgUs = Stats.summarize(avgSamples)
+                let gpuMs = Stats.summarize(gpuMsSamples)
+                let nClamped = min(max(1, n), 1024 * 1024)
+
+                switch format {
+                case .human:
+                    print(String(
+                        format: "scan n=%d iters=%d warmup=%d reps=%d avg_us_p50=%.3f avg_us_p95=%.3f gpu_ms_p50=%.3f gpu_ms_p95=%.3f ok=%@",
+                        nClamped,
+                        iters,
+                        warmup,
+                        avgUs.count,
+                        avgUs.p50,
+                        avgUs.p95,
+                        gpuMs.p50,
+                        gpuMs.p95,
+                        okAll ? "true" : "false"
+                    ))
+                case .json, .jsonl:
+                    let obj: [String: Any] = [
+                        "bench": "scan",
+                        "n": nClamped,
+                        "iters": iters,
+                        "warmup": warmup,
+                        "reps": avgUs.count,
+                        "avg_us_p50": avgUs.p50,
+                        "avg_us_p95": avgUs.p95,
+                        "gpu_ms_p50": gpuMs.p50,
+                        "gpu_ms_p95": gpuMs.p95,
+                        "ok": okAll,
+                    ]
+                    let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+                    print(String(decoding: data, as: UTF8.self))
+                case .csv:
+                    printCSV(
+                        header: ["bench", "n", "iters", "warmup", "reps", "avg_us_p50", "avg_us_p95", "gpu_ms_p50", "gpu_ms_p95", "ok"],
+                        rows: [[
+                            "scan",
+                            "\(nClamped)",
+                            "\(iters)",
+                            "\(warmup)",
+                            "\(avgUs.count)",
+                            "\(avgUs.p50)",
+                            "\(avgUs.p95)",
+                            "\(gpuMs.p50)",
+                            "\(gpuMs.p95)",
+                            okAll ? "true" : "false",
+                        ]]
+                    )
+                }
             }
 
         case "scan-sweep":
@@ -554,6 +782,7 @@ do {
             let k = reader.popInt(for: "--k") ?? 256
             let iters = reader.popInt(for: "--iters") ?? 50
             let warmup = reader.popInt(for: "--warmup") ?? 10
+            let reps = reader.popInt(for: "--reps") ?? 1
             let variantRaw = reader.popValue(for: "--variant") ?? "tiled16"
             guard let variant = MatmulVariant(rawValue: variantRaw) else {
                 die("invalid --variant '\(variantRaw)' (expected naive|tiled8|tiled16|tiled32)")
@@ -563,43 +792,148 @@ do {
             let format = OutputOptions.parse(&reader, defaultFormat: .human, jsonImplies: .json)
             if !reader.isEmpty { usage(1) }
 
-            let result = try MatmulBenchmark.run(
-                context: context,
-                kernels: kernels,
-                m: m,
-                n: n,
-                k: k,
-                iters: iters,
-                warmup: warmup,
-                variant: variant,
-                tgX: tgX,
-                tgY: tgY
-            )
-            switch format {
-            case .human:
-                print(result.prettyLine)
-            case .json, .jsonl:
-                print(try result.jsonLine())
-            case .csv:
-                printCSV(
-                    header: ["bench", "variant", "tg_x", "tg_y", "m", "n", "k", "iters", "warmup", "gpu_seconds", "wall_seconds", "avg_us", "gflops", "ok"],
-                    rows: [[
-                        "matmul",
-                        result.variant.rawValue,
-                        result.tgX.map { "\($0)" } ?? "",
-                        result.tgY.map { "\($0)" } ?? "",
-                        "\(result.m)",
-                        "\(result.n)",
-                        "\(result.k)",
-                        "\(result.iters)",
-                        "\(result.warmup)",
-                        "\(result.gpuSeconds)",
-                        "\(result.wallSeconds)",
-                        "\(result.avgMicros)",
-                        "\(result.gflops)",
-                        result.ok ? "true" : "false",
-                    ]]
+            let clampedReps = max(1, reps)
+            if clampedReps == 1 {
+                let result = try MatmulBenchmark.run(
+                    context: context,
+                    kernels: kernels,
+                    m: m,
+                    n: n,
+                    k: k,
+                    iters: iters,
+                    warmup: warmup,
+                    variant: variant,
+                    tgX: tgX,
+                    tgY: tgY
                 )
+                switch format {
+                case .human:
+                    print(result.prettyLine)
+                case .json, .jsonl:
+                    print(try result.jsonLine())
+                case .csv:
+                    printCSV(
+                        header: ["bench", "variant", "tg_x", "tg_y", "m", "n", "k", "iters", "warmup", "gpu_seconds", "wall_seconds", "avg_us", "gflops", "ok"],
+                        rows: [[
+                            "matmul",
+                            result.variant.rawValue,
+                            result.tgX.map { "\($0)" } ?? "",
+                            result.tgY.map { "\($0)" } ?? "",
+                            "\(result.m)",
+                            "\(result.n)",
+                            "\(result.k)",
+                            "\(result.iters)",
+                            "\(result.warmup)",
+                            "\(result.gpuSeconds)",
+                            "\(result.wallSeconds)",
+                            "\(result.avgMicros)",
+                            "\(result.gflops)",
+                            result.ok ? "true" : "false",
+                        ]]
+                    )
+                }
+            } else {
+                var avgSamples: [Double] = []
+                var gflopsSamples: [Double] = []
+                var gpuMsSamples: [Double] = []
+                avgSamples.reserveCapacity(clampedReps)
+                gflopsSamples.reserveCapacity(clampedReps)
+                gpuMsSamples.reserveCapacity(clampedReps)
+                var okAll = true
+
+                var resultMeta: MatmulResult?
+                for _ in 0..<clampedReps {
+                    let r = try MatmulBenchmark.run(
+                        context: context,
+                        kernels: kernels,
+                        m: m,
+                        n: n,
+                        k: k,
+                        iters: iters,
+                        warmup: warmup,
+                        variant: variant,
+                        tgX: tgX,
+                        tgY: tgY
+                    )
+                    resultMeta = resultMeta ?? r
+                    avgSamples.append(r.avgMicros)
+                    gflopsSamples.append(r.gflops)
+                    gpuMsSamples.append(r.gpuSeconds * 1000.0)
+                    okAll = okAll && r.ok
+                }
+
+                let avgUs = Stats.summarize(avgSamples)
+                let gflops = Stats.summarize(gflopsSamples)
+                let gpuMs = Stats.summarize(gpuMsSamples)
+                let meta = resultMeta!
+
+                switch format {
+                case .human:
+                    var head = "matmul var=\(meta.variant.rawValue)"
+                    if let x = meta.tgX, let y = meta.tgY { head += " tg=\(x)x\(y)" }
+                    print(String(
+                        format: "%@ m=%d n=%d k=%d iters=%d warmup=%d reps=%d gflops_p50=%.2f gflops_p95=%.2f avg_us_p50=%.3f avg_us_p95=%.3f gpu_ms_p50=%.3f gpu_ms_p95=%.3f ok=%@",
+                        head,
+                        meta.m, meta.n, meta.k,
+                        meta.iters,
+                        meta.warmup,
+                        gflops.count,
+                        gflops.p50,
+                        gflops.p95,
+                        avgUs.p50,
+                        avgUs.p95,
+                        gpuMs.p50,
+                        gpuMs.p95,
+                        okAll ? "true" : "false"
+                    ))
+                case .json, .jsonl:
+                    var obj: [String: Any] = [
+                        "bench": "matmul",
+                        "variant": meta.variant.rawValue,
+                        "m": meta.m,
+                        "n": meta.n,
+                        "k": meta.k,
+                        "iters": meta.iters,
+                        "warmup": meta.warmup,
+                        "reps": gflops.count,
+                        "gflops_p50": gflops.p50,
+                        "gflops_p95": gflops.p95,
+                        "avg_us_p50": avgUs.p50,
+                        "avg_us_p95": avgUs.p95,
+                        "gpu_ms_p50": gpuMs.p50,
+                        "gpu_ms_p95": gpuMs.p95,
+                        "ok": okAll,
+                    ]
+                    if let x = meta.tgX, let y = meta.tgY {
+                        obj["tg_x"] = x
+                        obj["tg_y"] = y
+                    }
+                    let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+                    print(String(decoding: data, as: UTF8.self))
+                case .csv:
+                    printCSV(
+                        header: ["bench", "variant", "tg_x", "tg_y", "m", "n", "k", "iters", "warmup", "reps", "gflops_p50", "gflops_p95", "avg_us_p50", "avg_us_p95", "gpu_ms_p50", "gpu_ms_p95", "ok"],
+                        rows: [[
+                            "matmul",
+                            meta.variant.rawValue,
+                            meta.tgX.map { "\($0)" } ?? "",
+                            meta.tgY.map { "\($0)" } ?? "",
+                            "\(meta.m)",
+                            "\(meta.n)",
+                            "\(meta.k)",
+                            "\(meta.iters)",
+                            "\(meta.warmup)",
+                            "\(gflops.count)",
+                            "\(gflops.p50)",
+                            "\(gflops.p95)",
+                            "\(avgUs.p50)",
+                            "\(avgUs.p95)",
+                            "\(gpuMs.p50)",
+                            "\(gpuMs.p95)",
+                            okAll ? "true" : "false",
+                        ]]
+                    )
+                }
             }
 
         case "matmul-sweep":
